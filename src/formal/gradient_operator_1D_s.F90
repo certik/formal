@@ -13,7 +13,7 @@ submodule(mimetic_operators_1D_m) gradient_operator_1D_s
 
 contains
 
-#ifdef __GFORTRAN__
+#if defined(__GFORTRAN__) || defined(__LFORTRAN__)
 
   pure function negate_and_flip(A) result(Ap)
     !! Transform a mimetic matrix upper block into a lower block
