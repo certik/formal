@@ -211,7 +211,14 @@ latency bound.  The second stage takes the velocities and base of its rows
 from registers (three rows carried from the previous chunk, the rest from
 the first stage's loads) instead of reloading them, which the L1 did not
 catch: 2048² 0.0703 → 0.0635 s, 1024² 0.0323 → 0.0302 s (interleaved),
-same register count.  Sweeps (block threads / rows per segment, s): 2048²
+same register count.  The rim grids are launched programmatically as well
+(they wait for the previous strip grid first, then release the next one),
+which hides part of the launch gap between the pair kernels: 2048² 0.0582
+→ 0.0574 s, 1024² unchanged.  Rejected: prefetching the next chunk's input
+rows and y-face velocities into registers during the second stage (180
+registers, one block fewer per SM: 0.0582 → 0.0655 s), capping the
+registers at 128 (spills: 0.106 s), 64 x 6 / 8 x 64 rim tiles (0.059 s) and
+16 x 6 / 8 x 16 rim tiles (0.079 s).  Sweeps (block threads / rows per segment, s): 2048²
 64/64 0.0637, 128/64 0.0641, 64/32 0.0668, 96/32 0.0678, 64/80 0.0693;
 1024² 64/24 0.0305, 96/24 0.0306, 64/32 0.0325.
 

@@ -3326,6 +3326,7 @@ template <int NW, int PAIR>
 __global__ void __launch_bounds__(32 * NW)
 fa_lpair(fa_lptr_t m, fa_step_params_t p, int col_lo, int col_hi, int row_lo, int row_hi, int H)
 {
+    asm volatile("griddepcontrol.launch_dependents;");
     constexpr int R = 8;
     constexpr int NT = 32 * NW;
     constexpr int W = 2 * NT - 12;
@@ -3744,6 +3745,10 @@ fa_rim_pair(fa_lptr_t m, fa_step_params_t p, fa_rim_bands_t bands, fa_rim_bands_
     constexpr int A = fa_rim_smem(32, 6);
     constexpr int B = fa_rim_smem(8, 32);
     __shared__ float smem[A > B ? A : B];
+    // Launched programmatically after the previous strip grid: wait for it
+    // (and its data) before anything else, then let the next strip grid
+    // launch.
+    asm volatile("griddepcontrol.wait;" ::: "memory");
     asm volatile("griddepcontrol.launch_dependents;");
     const int nb = bands.first[bands.n];
     if ((int)blockIdx.x < nb) {
@@ -3825,16 +3830,19 @@ static void fa_launch_lean2(const fa_config_t *cfg, fa_device_t *d, int parity, 
     lc.numAttrs = 1;
     const bool strips = col_hi > col_lo && row_hi > row_lo;
     const int nrim = bands.first[bands.n] + sides.first[sides.n];
+    cudaLaunchConfig_t rc = lc;
+    rc.gridDim = dim3(nrim, 1, 1);
+    rc.blockDim = dim3(256, 1, 1);
     m.in = d->m.base[parity];
     m.out = d->m.stage[0];
-    fa_rim_pair<0><<<nrim, 256, 0, s>>>(m, p, bands, sides);
+    fa_cuda_check(cudaLaunchKernelEx(&rc, fa_rim_pair<0>, m, p, bands, sides), "lean2 rim");
     if (strips) {
         fa_cuda_check(cudaLaunchKernelEx(&lc, fa_lpair<NW, 0>, m, p, col_lo, col_hi, row_lo,
             row_hi, H), "lean2 launch");
     }
     m.in = d->m.stage[0];
     m.out = d->m.base[parity ^ 1];
-    fa_rim_pair<1><<<nrim, 256, 0, s>>>(m, p, bands, sides);
+    fa_cuda_check(cudaLaunchKernelEx(&rc, fa_rim_pair<1>, m, p, bands, sides), "lean2 rim");
     if (strips) {
         fa_cuda_check(cudaLaunchKernelEx(&lc, fa_lpair<NW, 1>, m, p, col_lo, col_hi, row_lo,
             row_hi, H), "lean2 launch");
