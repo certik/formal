@@ -2245,7 +2245,8 @@ __device__ __forceinline__ void fa_m2_stage(int a, int t, const fa_march_geo_t &
     const fa_step_params_t &p, const fa_mptr_t &m, float (*xb)[64 * NW + 8],
     float (*fd)[64 * NW + 8], float (*fa)[64 * NW + 8], float (*xs)[2][FA_M_R],
     float (&cur)[2][FA_M_R], float (&accv)[2][FA_M_R], float (&rc)[2][3],
-    float (&ydc)[2][3], float (&yac)[2][3], float (&ac)[2][3], float (&cap)[2][3])
+    float (&ydc)[2][3], float (&yac)[2][3], float (&ac)[2][3], float (&cap)[2][3],
+    bool prefetch)
 {
     constexpr int R = FA_M_R;
     constexpr int NT = 32 * NW;
@@ -2254,6 +2255,24 @@ __device__ __forceinline__ void fa_m2_stage(int a, int t, const fa_march_geo_t &
     const int ps = m.ps;
     const int c = g.c;
     const int b = a - 3 * S;            // output rows [b, b + R)
+
+    // All global loads of the stage first (their latency overlaps the
+    // first barrier): y-face and x-face velocities and base.
+    float2 vyl[R];
+    float2 vxl[R];
+    float2 bl[R];
+#pragma unroll
+    for (int q = 0; q < R; ++q) {
+        vyl[q] = fa_ld2(m.vy + c + ps * (b + 1 + q));
+    }
+#pragma unroll
+    for (int q = 0; q < R; ++q) {
+        vxl[q] = fa_ld2(m.vx + c + m.pf * (b + q));
+    }
+#pragma unroll
+    for (int q = 0; q < R; ++q) {
+        bl[q] = fa_ld2(m.bin + c + ps * (b + q));
+    }
 
     // Stage-input rows [b, b + R + 3) (three carried) and y faces
     // [b - 2, b + R + 1) (three carried, R new; face f uses rows f-1 .. f+2).
@@ -2277,23 +2296,13 @@ __device__ __forceinline__ void fa_m2_stage(int a, int t, const fa_march_geo_t &
             rc[e][q] = w[e][R + q];
         }
     }
+    if (S == 4 && prefetch) {
+        // The next chunk's input rows (cur is dead once w is built).
 #pragma unroll
-    for (int q = 0; q < R; ++q) {
-        const float2 v = fa_ld2(m.vy + c + ps * (b + 1 + q));
-#pragma unroll
-        for (int e = 0; e < 2; ++e) {
-            yd[e][q + 3] = fa_hgrad_interior(w[e][q], w[e][q + 1], w[e][q + 2], w[e][q + 3],
-                p.inv_dy);
-            ya[e][q + 3] = (e ? v.y : v.x) * fa_interp_interior(w[e][q], w[e][q + 1],
-                w[e][q + 2], w[e][q + 3]);
-        }
-    }
-#pragma unroll
-    for (int e = 0; e < 2; ++e) {
-#pragma unroll
-        for (int q = 0; q < 3; ++q) {
-            ydc[e][q] = yd[e][R + q];
-            yac[e][q] = ya[e][R + q];
+        for (int r = 0; r < R; ++r) {
+            const float2 v = fa_ld2(m.bin + c + ps * (a + R + r));
+            cur[0][r] = v.x;
+            cur[1][r] = v.y;
         }
     }
 
@@ -2372,19 +2381,36 @@ __device__ __forceinline__ void fa_m2_stage(int a, int t, const fa_march_geo_t &
         *reinterpret_cast<float2 *>(&xb[r][2 * t + 4]) = make_float2(w[0][r], w[1][r]);
     }
     __syncthreads();
-    float od[R][2];
-    float oa[R][2];
+    // y faces (after the barrier, so that the velocity loads have landed).
+#pragma unroll
+    for (int q = 0; q < R; ++q) {
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+            yd[e][q + 3] = fa_hgrad_interior(w[e][q], w[e][q + 1], w[e][q + 2], w[e][q + 3],
+                p.inv_dy);
+            ya[e][q + 3] = (e ? vyl[q].y : vyl[q].x) * fa_interp_interior(w[e][q],
+                w[e][q + 1], w[e][q + 2], w[e][q + 3]);
+        }
+    }
+#pragma unroll
+    for (int e = 0; e < 2; ++e) {
+#pragma unroll
+        for (int q = 0; q < 3; ++q) {
+            ydc[e][q] = yd[e][R + q];
+            yac[e][q] = ya[e][R + q];
+        }
+    }
 #pragma unroll
     for (int r = 0; r < R; ++r) {
         const float sm = xb[r][2 * t + 3];
         const float2 sp = *reinterpret_cast<const float2 *>(&xb[r][2 * t + 6]);
-        const float2 v = fa_ld2(m.vx + c + m.pf * (b + r));
-        od[r][0] = fa_hgrad_interior(sm, w[0][r], w[1][r], sp.x, p.inv_dx);
-        od[r][1] = fa_hgrad_interior(w[0][r], w[1][r], sp.x, sp.y, p.inv_dx);
-        oa[r][0] = v.x * fa_interp_interior(sm, w[0][r], w[1][r], sp.x);
-        oa[r][1] = v.y * fa_interp_interior(w[0][r], w[1][r], sp.x, sp.y);
-        *reinterpret_cast<float2 *>(&fd[r][2 * t + 4]) = make_float2(od[r][0], od[r][1]);
-        *reinterpret_cast<float2 *>(&fa[r][2 * t + 4]) = make_float2(oa[r][0], oa[r][1]);
+        const float2 v = vxl[r];
+        const float d0 = fa_hgrad_interior(sm, w[0][r], w[1][r], sp.x, p.inv_dx);
+        const float d1 = fa_hgrad_interior(w[0][r], w[1][r], sp.x, sp.y, p.inv_dx);
+        const float a0 = v.x * fa_interp_interior(sm, w[0][r], w[1][r], sp.x);
+        const float a1 = v.y * fa_interp_interior(w[0][r], w[1][r], sp.x, sp.y);
+        *reinterpret_cast<float2 *>(&fd[r][2 * t + 4]) = make_float2(d0, d1);
+        *reinterpret_cast<float2 *>(&fa[r][2 * t + 4]) = make_float2(a0, a1);
     }
     if (FRAME && g.xgen) {
         // Boundary-side x faces (0, 1, nx-1, nx) from the general rows, one
@@ -2445,21 +2471,14 @@ __device__ __forceinline__ void fa_m2_stage(int a, int t, const fa_march_geo_t &
         const float dp = fd[r][2 * t + 6];
         const float2 am = *reinterpret_cast<const float2 *>(&fa[r][2 * t + 2]);
         const float ap = fa[r][2 * t + 6];
-        if (FRAME && g.xgen) {
-            // Own faces may have been replaced by the general rows.
-            const float2 d0 = *reinterpret_cast<const float2 *>(&fd[r][2 * t + 4]);
-            const float2 a0 = *reinterpret_cast<const float2 *>(&fa[r][2 * t + 4]);
-            od[r][0] = d0.x;
-            od[r][1] = d0.y;
-            oa[r][0] = a0.x;
-            oa[r][1] = a0.y;
-        }
+        const float2 d0 = *reinterpret_cast<const float2 *>(&fd[r][2 * t + 4]);
+        const float2 a0 = *reinterpret_cast<const float2 *>(&fa[r][2 * t + 4]);
         float diffx[2], advx[2];
-        diffx[0] = fa_div_interior(dm.x, dm.y, od[r][0], od[r][1], p.inv_dx);
-        diffx[1] = fa_div_interior(dm.y, od[r][0], od[r][1], dp, p.inv_dx);
-        advx[0] = fa_div_interior(am.x, am.y, oa[r][0], oa[r][1], p.inv_dx);
-        advx[1] = fa_div_interior(am.y, oa[r][0], oa[r][1], ap, p.inv_dx);
-        const float2 bj2 = fa_ld2(m.bin + c + ps * j);
+        diffx[0] = fa_div_interior(dm.x, dm.y, d0.x, d0.y, p.inv_dx);
+        diffx[1] = fa_div_interior(dm.y, d0.x, d0.y, dp, p.inv_dx);
+        advx[0] = fa_div_interior(am.x, am.y, a0.x, a0.y, p.inv_dx);
+        advx[1] = fa_div_interior(am.y, a0.x, a0.y, ap, p.inv_dx);
+        const float2 bj2 = bl[r];
         float out[2];
 #pragma unroll
         for (int e = 0; e < 2; ++e) {
@@ -2538,33 +2557,38 @@ __device__ __forceinline__ void fa_m2_run(const fa_march_geo_t &g, int K,
         }
     }
     const int skip = g.y_lo - 12 - g.r0;
+    float cur[2][R];
+    float accv[2][R];
+    bool have = false;                  // cur already holds the chunk input
     for (int k = 0; k < K; ++k) {
         const int a = g.r0 + k * R;
-        float cur[2][R];
-        float accv[2][R];
 #pragma unroll
         for (int r = 0; r < R; ++r) {
-            const float2 v = fa_ld2(m.bin + g.c + m.ps * (a + r));
-            cur[0][r] = v.x;
-            cur[1][r] = v.y;
+            if (!have) {
+                const float2 v = fa_ld2(m.bin + g.c + m.ps * (a + r));
+                cur[0][r] = v.x;
+                cur[1][r] = v.y;
+            }
             accv[0][r] = 0.0f;
             accv[1][r] = 0.0f;
         }
         const int kr = (k + 2) * R - skip;
+        const bool pf = k + 1 < K;
         fa_m2_stage<NW, 1, FRAME, YM>(a, t, g, p, m, xb, fd, fa, xs, cur, accv, rc[0],
-            ydc[0], yac[0], ac[0], cap[0]);
+            ydc[0], yac[0], ac[0], cap[0], false);
         if (kr > 12) {
             fa_m2_stage<NW, 2, FRAME, YM>(a, t, g, p, m, xb, fd, fa, xs, cur, accv, rc[1],
-                ydc[1], yac[1], ac[1], cap[1]);
+                ydc[1], yac[1], ac[1], cap[1], false);
         }
         if (kr > 18) {
             fa_m2_stage<NW, 3, FRAME, YM>(a, t, g, p, m, xb, fd, fa, xs, cur, accv, rc[2],
-                ydc[2], yac[2], ac[2], cap[2]);
+                ydc[2], yac[2], ac[2], cap[2], false);
         }
         if (kr > 24) {
             fa_m2_stage<NW, 4, FRAME, YM>(a, t, g, p, m, xb, fd, fa, xs, cur, accv, rc[3],
-                ydc[3], yac[3], ac[3], cap[3]);
+                ydc[3], yac[3], ac[3], cap[3], pf);
         }
+        have = kr > 24 && pf;
     }
 }
 
