@@ -100,6 +100,7 @@ typedef struct {
     uint32_t tile_y;
     fa_kernel_t kernel;
     bool graph;
+    uint32_t graph_steps;
     uint32_t frame_parts;
 } fa_options_t;
 
@@ -4162,17 +4163,26 @@ static void fa_run_cuda(const fa_options_t *opt, fa_fields_t *fields,
     fa_cuda_check(cudaEventCreate(&ev_start), "event");
     fa_cuda_check(cudaEventCreate(&ev_end), "event");
 
-    // Optional CUDA Graphs holding one whole timestep, one per base-buffer
-    // parity (identical for the in-place variants).
-    cudaGraphExec_t step_graph[2] = {NULL, NULL};
+    // Optional CUDA Graphs: one whole timestep per base-buffer parity
+    // (identical for the in-place variants), and one of --graph-steps
+    // timesteps starting at parity 0 (each graph launch costs about a
+    // microsecond of GPU time).
+    const uint32_t gsteps = opt->graph_steps;
+    cudaGraphExec_t step_graph[3] = {NULL, NULL, NULL};
     if (opt->graph) {
-        for (int parity = 0; parity < 2; ++parity) {
+        for (int g = 0; g < 3; ++g) {
+            if (g == 2 && gsteps < 2) {
+                break;
+            }
             cudaGraph_t graph;
             fa_cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
                 "begin capture");
-            fa_launch_step(opt, &d, parity, stream);
+            const uint32_t n = g == 2 ? gsteps : 1;
+            for (uint32_t k = 0; k < n; ++k) {
+                fa_launch_step(opt, &d, g == 2 ? (int)(k & 1u) : g, stream);
+            }
             fa_cuda_check(cudaStreamEndCapture(stream, &graph), "end capture");
-            fa_cuda_check(cudaGraphInstantiate(&step_graph[parity], graph, 0),
+            fa_cuda_check(cudaGraphInstantiate(&step_graph[g], graph, 0),
                 "graph instantiate");
             fa_cuda_check(cudaGraphDestroy(graph), "graph destroy");
         }
@@ -4201,13 +4211,19 @@ static void fa_run_cuda(const fa_options_t *opt, fa_fields_t *fields,
 
     const double solve_start = fa_now_seconds();
     fa_cuda_check(cudaEventRecord(ev_start, stream), "record start");
-    for (uint32_t step = 0; step < opt->cfg.steps; ++step) {
+    for (uint32_t step = 0; step < opt->cfg.steps;) {
         const int parity = (int)(step & 1u);
+        if (opt->graph && step_graph[2] && parity == 0 && opt->cfg.steps - step >= gsteps) {
+            fa_cuda_check(cudaGraphLaunch(step_graph[2], stream), "graph launch");
+            step += gsteps;
+            continue;
+        }
         if (opt->graph) {
             fa_cuda_check(cudaGraphLaunch(step_graph[parity], stream), "graph launch");
         } else {
             fa_launch_step(opt, &d, parity, stream);
         }
+        ++step;
     }
     fa_cuda_check(cudaGetLastError(), "solve launch");
     fa_cuda_check(cudaEventRecord(ev_end, stream), "record end");
@@ -4233,9 +4249,9 @@ static void fa_run_cuda(const fa_options_t *opt, fa_fields_t *fields,
     fa_check_finite(fields->base, fields->scalar_len, "final scalar");
     stats->final_all_finite = true;
 
-    for (int parity = 0; parity < 2; ++parity) {
-        if (step_graph[parity]) {
-            cudaGraphExecDestroy(step_graph[parity]);
+    for (int g = 0; g < 3; ++g) {
+        if (step_graph[g]) {
+            cudaGraphExecDestroy(step_graph[g]);
         }
     }
     cudaEventDestroy(ev_start);
@@ -4274,7 +4290,8 @@ static void fa_usage(const char *argv0)
         "usage: %s [--mode cpu|cuda] [--cells nx,ny] [--steps n] [--dt dt]\n"
         "          [--input path] [--output path] [--dump [path]] [--dump-bin [path]]\n"
         "          [--kernel auto|split|fused|tiled|prefetch|regy|regyf|pair|march|lean|lean2] [--block x[,y]]\n"
-        "          [--tile-x n] [--tile-y n] [--frame-parts n] [--graph on|off]\n",
+        "          [--tile-x n] [--tile-y n] [--frame-parts n] [--graph on|off]\n"
+        "          [--graph-steps n]\n",
         argv0);
 }
 
@@ -4318,6 +4335,7 @@ int main(int argc, char **argv)
     opt.tile_x = 0;
     opt.tile_y = 0;
     opt.frame_parts = 2;
+    opt.graph_steps = 10;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -4375,6 +4393,11 @@ int main(int argc, char **argv)
             opt.block_supplied = true;
         } else if (strcmp(argv[i], "--tile-x") == 0 && i + 1 < argc) {
             opt.tile_x = fa_parse_u32_strict(argv[++i], "--tile-x");
+        } else if (strcmp(argv[i], "--graph-steps") == 0 && i + 1 < argc) {
+            opt.graph_steps = fa_parse_u32_strict(argv[++i], "--graph-steps");
+            if (opt.graph_steps < 1 || opt.graph_steps > 1000) {
+                fa_die("--graph-steps must be 1..1000");
+            }
         } else if (strcmp(argv[i], "--frame-parts") == 0 && i + 1 < argc) {
             opt.frame_parts = fa_parse_u32_strict(argv[++i], "--frame-parts");
             if (opt.frame_parts < 1 || opt.frame_parts > 8) {

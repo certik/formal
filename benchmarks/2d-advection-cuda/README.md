@@ -19,7 +19,8 @@ rhs = div(D * grad(s)) - div(v * interp(s))
 This is not a five-point Laplacian or a lower-order substitute.  Scalar
 boundaries remain fixed, the FP32 column-major field layout matches Formal,
 and the RK4 accumulator is updated in the same `k1 + 2*k2 + 2*k3 + k4`
-order.  Every CUDA variant evaluates the same face fluxes, divergences and
+order (the `march`, `lean` and `lean2` variants keep a padded copy of the
+fields on the device; host input and output keep Formal's layout).  Every CUDA variant evaluates the same face fluxes, divergences and
 stage updates with the same operation order; the variants differ only in
 how the work is mapped onto the GPU (fusion, tiling, on-chip reuse).
 
@@ -53,7 +54,8 @@ Options (same conventions as the Metal reference):
 | `--kernel <variant>` | `auto` (default), `split`, `fused`, `tiled`, `prefetch`, `regy`, `regyf`, `pair`, `march`, `lean`, `lean2`; see [PERFORMANCE.md](./PERFORMANCE.md) |
 | `--block x,y`, `--tile-x n`, `--tile-y n` | launch geometry (each variant has tuned defaults) |
 | `--frame-parts n` | `march`: split boundary tiles into n row parts (default 2) |
-| `--graph on\|off` | launch each timestep as a CUDA Graph (default on) |
+| `--graph on\|off` | launch the timesteps as CUDA Graphs (default on) |
+| `--graph-steps n` | timesteps per graph launch (default 10) |
 
 The output line `RESULT mode=... solve_wall=... gpu_busy=...` reports the
 solve-region wall time (all timesteps plus the final device-to-host copy of
