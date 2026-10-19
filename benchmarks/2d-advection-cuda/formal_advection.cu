@@ -65,6 +65,7 @@ typedef enum {
     FA_KERNEL_PAIR,
     FA_KERNEL_MARCH,
     FA_KERNEL_LEAN,
+    FA_KERNEL_LEAN2,
     FA_KERNEL_AUTO,
     FA_KERNEL_COUNT_
 } fa_kernel_t;
@@ -79,6 +80,7 @@ static const char *FA_KERNEL_NAMES[FA_KERNEL_COUNT_] = {
     "pair",
     "march",
     "lean",
+    "lean2",
     "auto",
 };
 
@@ -3237,6 +3239,592 @@ static void fa_launch_lean(const fa_config_t *cfg, fa_device_t *d, int parity, i
     fa_launch_lean_stage<NW, 4>(cfg, m, H, s);
 }
 
+// Variant "lean2": "lean" with two RK stages per kernel (stages 1 + 2, then
+// 3 + 4).  A strip block (2*NT - 12 columns plus a 6-column halo on each
+// side, segments of H rows) marches down its segment with the second stage
+// three rows behind the first; both stages carry their stage values and y
+// faces in registers, the stage-1 (stage-3) values, rates and accumulator
+// never leave the chip.  A prologue evaluates the first stage on the six
+// rows around the segment start, so no row is loaded or computed twice
+// beyond the 6-row halo of the stage input.  Global traffic per step: read
+// base, u2, the accumulator and the velocities (twice), write u2, the
+// accumulator and the new base: about 11 field accesses instead of the 26 of
+// the per-stage scheme.  The boundary rim (cells within 6-7 cells of a
+// boundary, 32 x 6 and 8 x 32 tiles) runs both stages with the general
+// operator rows in shared memory, in a grid launched before the strips;
+// the strips are launched programmatically (see "lean").
+//
+// fa_lp_rhs: one stage on RR rows b .. b+RR-1.  w[e][3 + q] holds rows
+// b + q (q < RR + 3; w[e][0..3) are unused), yd/ya[e][0..3) the carried y
+// faces b-2 .. b; the new faces b+1 .. b+RR are added.  x faces go through
+// shared memory.  Produces rhs[e][r].
+template <int NW, int RR>
+__device__ __forceinline__ void fa_lp_rhs(int t, const fa_step_params_t &p,
+    float (&w)[2][RR + 6], float (&yd)[2][RR + 3], float (&ya)[2][RR + 3],
+    const float2 (&vyl)[RR], const float2 (&vxl)[RR], float (*xb)[64 * NW + 8],
+    float (*fd)[64 * NW + 8], float (*fa)[64 * NW + 8], float (&rhs)[2][RR])
+{
+    // w[e][q]: rows b-3 .. b+RR+3 (RR+6 values); yd/ya[e][0..3) carried faces
+    // b-2..b, new faces b+1 .. b+RR (from rows q.. q+3 with q = face - b + 2).
+#pragma unroll
+    for (int r = 0; r < RR; ++r) {
+        *reinterpret_cast<float2 *>(&xb[r][2 * t + 4]) = make_float2(w[0][r + 3], w[1][r + 3]);
+    }
+    __syncthreads();
+#pragma unroll
+    for (int q = 0; q < RR; ++q) {
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+            yd[e][q + 3] = fa_hgrad_interior(w[e][q + 3], w[e][q + 4], w[e][q + 5], w[e][q + 6] ,
+                p.inv_dy);
+            ya[e][q + 3] = (e ? vyl[q].y : vyl[q].x) * fa_interp_interior(w[e][q + 3],
+                w[e][q + 4], w[e][q + 5], w[e][q + 6]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < RR; ++r) {
+        const float sm = xb[r][2 * t + 3];
+        const float2 sp = *reinterpret_cast<const float2 *>(&xb[r][2 * t + 6]);
+        const float w0 = w[0][r + 3], w1 = w[1][r + 3];
+        const float d0 = fa_hgrad_interior(sm, w0, w1, sp.x, p.inv_dx);
+        const float d1 = fa_hgrad_interior(w0, w1, sp.x, sp.y, p.inv_dx);
+        const float a0 = vxl[r].x * fa_interp_interior(sm, w0, w1, sp.x);
+        const float a1 = vxl[r].y * fa_interp_interior(w0, w1, sp.x, sp.y);
+        *reinterpret_cast<float2 *>(&fd[r][2 * t + 4]) = make_float2(d0, d1);
+        *reinterpret_cast<float2 *>(&fa[r][2 * t + 4]) = make_float2(a0, a1);
+    }
+    __syncthreads();
+#pragma unroll
+    for (int r = 0; r < RR; ++r) {
+        const float2 dm = *reinterpret_cast<const float2 *>(&fd[r][2 * t + 2]);
+        const float2 d0 = *reinterpret_cast<const float2 *>(&fd[r][2 * t + 4]);
+        const float dp = fd[r][2 * t + 6];
+        const float2 am = *reinterpret_cast<const float2 *>(&fa[r][2 * t + 2]);
+        const float2 a0 = *reinterpret_cast<const float2 *>(&fa[r][2 * t + 4]);
+        const float ap = fa[r][2 * t + 6];
+        float diffx[2], advx[2];
+        diffx[0] = fa_div_interior(dm.x, dm.y, d0.x, d0.y, p.inv_dx);
+        diffx[1] = fa_div_interior(dm.y, d0.x, d0.y, dp, p.inv_dx);
+        advx[0] = fa_div_interior(am.x, am.y, a0.x, a0.y, p.inv_dx);
+        advx[1] = fa_div_interior(am.y, a0.x, a0.y, ap, p.inv_dx);
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+            const float diffy = fa_div_interior(yd[e][r], yd[e][r + 1], yd[e][r + 2],
+                yd[e][r + 3], p.inv_dy);
+            const float advy = fa_div_interior(ya[e][r], ya[e][r + 1], ya[e][r + 2],
+                ya[e][r + 3], p.inv_dy);
+            rhs[e][r] = (diffx[e] + diffy) - (advx[e] + advy);
+        }
+    }
+}
+
+// PAIR 0: stages 1, 2 (in = base): writes u2 (out) and acc = k1 + 2 k2.
+// PAIR 1: stages 3, 4 (in = u2): acc3 = acc + 2 k3 on chip, writes the new
+// base (out).  Strips cover columns [col_lo, col_hi) and rows [row_lo,
+// row_hi).
+template <int NW, int PAIR>
+__global__ void __launch_bounds__(32 * NW)
+fa_lpair(fa_lptr_t m, fa_step_params_t p, int col_lo, int col_hi, int row_lo, int row_hi, int H)
+{
+    constexpr int R = 8;
+    constexpr int NT = 32 * NW;
+    constexpr int W = 2 * NT - 12;
+    __shared__ __align__(16) float xb[R][2 * NT + 8];
+    __shared__ __align__(16) float fd[R][2 * NT + 8];
+    __shared__ __align__(16) float fa[R][2 * NT + 8];
+    const int t = threadIdx.x;
+    for (int q = t; q < R * (2 * NT + 8); q += NT) {
+        (&xb[0][0])[q] = 0.0f;
+        (&fd[0][0])[q] = 0.0f;
+        (&fa[0][0])[q] = 0.0f;
+    }
+    __syncthreads();
+    const int c0 = col_lo + (int)blockIdx.x * W;      // even
+    const int y0 = row_lo + (int)blockIdx.y * H;
+    const int y1 = min(y0 + H, row_hi);
+    const int c_hi = min(c0 + W, col_hi);
+    const int c = c0 - 6 + 2 * t;                      // even
+    const int ps = m.ps;
+    const int pf = m.pf;
+    const float alA = PAIR == 0 ? p.dt_half : p.dt;
+    // ---- prologue: stage A on rows [y0-3, y0+3) ----
+    float ra[2][3], ydA[2][3], yaA[2][3];      // stage-A carries (rows, faces)
+    float rb[2][3], ydB[2][3], yaB[2][3];      // stage-B carries
+    float kc[2][3];                             // aux (k1 or acc3) rows carried
+    {
+        constexpr int RR = 6;
+        float w[2][RR + 6];                    // input rows [y0-6, y0+6)
+        float yd[2][RR + 3], ya[2][RR + 3];
+        float2 vyl[RR], vxl[RR];
+        float2 pin[RR + 6];
+#pragma unroll
+        for (int q = 0; q < RR + 6; ++q) {
+            pin[q] = fa_ld2(m.in + c + ps * (y0 - 6 + q));
+        }
+#pragma unroll
+        for (int q = 0; q < RR; ++q) {
+            vyl[q] = fa_ld2(m.vy + c + ps * (y0 - 2 + q));
+            vxl[q] = fa_ld2(m.vx + c + pf * (y0 - 3 + q));
+        }
+        float2 vyc[3];
+#pragma unroll
+        for (int q = 0; q < 3; ++q) {
+            vyc[q] = fa_ld2(m.vy + c + ps * (y0 - 5 + q));
+        }
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+#pragma unroll
+            for (int q = 0; q < RR + 6; ++q) {
+                w[e][q] = e ? pin[q].y : pin[q].x;
+            }
+            // carried faces y0-5 .. y0-3 (rows y0-6 ..)
+#pragma unroll
+            for (int q = 0; q < 3; ++q) {
+                yd[e][q] = fa_hgrad_interior(w[e][q], w[e][q + 1], w[e][q + 2], w[e][q + 3],
+                    p.inv_dy);
+                ya[e][q] = (e ? vyc[q].y : vyc[q].x) * fa_interp_interior(w[e][q],
+                    w[e][q + 1], w[e][q + 2], w[e][q + 3]);
+            }
+        }
+        float rhs[2][RR];
+        fa_lp_rhs<NW, RR>(t, p, w, yd, ya, vyl, vxl, xb, fd, fa, rhs);
+        // stage-A carries for chunk 0: rows [y0+3, y0+6), faces [y0+1, y0+4)
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+#pragma unroll
+            for (int q = 0; q < 3; ++q) {
+                ra[e][q] = w[e][RR + 3 + q];
+                ydA[e][q] = yd[e][RR + q];
+                yaA[e][q] = ya[e][RR + q];
+            }
+        }
+        // stage-A values on rows [y0-3, y0+3)
+        float u[2][RR], aux[2][RR];
+#pragma unroll
+        for (int r = 0; r < RR; ++r) {
+            const float2 bj = fa_ld2(m.base + c + ps * (y0 - 3 + r));
+            const float2 aj = PAIR == 1 ? fa_ld2(m.acc + c + ps * (y0 - 3 + r)) :
+                make_float2(0.0f, 0.0f);
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const float b = e ? bj.y : bj.x;
+                u[e][r] = b + alA * rhs[e][r];
+                aux[e][r] = PAIR == 0 ? rhs[e][r] : (e ? aj.y : aj.x) + 2.0f * rhs[e][r];
+            }
+        }
+        // stage-B carries: rows [y0, y0+3) = u[3..6), faces [y0-2, y0+1) from
+        // u rows [y0-3, y0+3)
+#pragma unroll
+        for (int q = 0; q < 3; ++q) {
+            const float2 v = fa_ld2(m.vy + c + ps * (y0 - 2 + q));
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                rb[e][q] = u[e][3 + q];
+                kc[e][q] = aux[e][3 + q];
+                ydB[e][q] = fa_hgrad_interior(u[e][q], u[e][q + 1], u[e][q + 2], u[e][q + 3],
+                    p.inv_dy);
+                yaB[e][q] = (e ? v.y : v.x) * fa_interp_interior(u[e][q], u[e][q + 1],
+                    u[e][q + 2], u[e][q + 3]);
+            }
+        }
+    }
+    // ---- main loop: stage-A rows [bA, bA+8), stage-B rows [bA-3, bA+5) ----
+    const int K = (y1 - y0 + R - 1) / R;
+    for (int k = 0; k < K; ++k) {
+        const int bA = y0 + 3 + k * R;
+        const int bB = bA - 3;
+        float uA[2][R], auxA[2][R];
+        {
+            float2 cur[R], vyl[R], vxl[R];
+#pragma unroll
+            for (int q = 0; q < R; ++q) {
+                cur[q] = fa_ld2(m.in + c + ps * (bA + 3 + q));
+                vyl[q] = fa_ld2(m.vy + c + ps * (bA + 1 + q));
+                vxl[q] = fa_ld2(m.vx + c + pf * (bA + q));
+            }
+            float w[2][R + 6];
+            float yd[2][R + 3], ya[2][R + 3];
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+#pragma unroll
+                for (int q = 0; q < 3; ++q) {
+                    w[e][q] = 0.0f;               // unused
+                    w[e][q + 3] = ra[e][q];
+                    yd[e][q] = ydA[e][q];
+                    ya[e][q] = yaA[e][q];
+                }
+#pragma unroll
+                for (int q = 0; q < R; ++q) {
+                    w[e][q + 6] = e ? cur[q].y : cur[q].x;
+                }
+            }
+            float rhs[2][R];
+            fa_lp_rhs<NW, R>(t, p, w, yd, ya, vyl, vxl, xb, fd, fa, rhs);
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+#pragma unroll
+                for (int q = 0; q < 3; ++q) {
+                    ra[e][q] = w[e][R + 3 + q];
+                    ydA[e][q] = yd[e][R + q];
+                    yaA[e][q] = ya[e][R + q];
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const float2 bj = fa_ld2(m.base + c + ps * (bA + r));
+                const float2 aj = PAIR == 1 ? fa_ld2(m.acc + c + ps * (bA + r)) :
+                    make_float2(0.0f, 0.0f);
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    uA[e][r] = (e ? bj.y : bj.x) + alA * rhs[e][r];
+                    auxA[e][r] = PAIR == 0 ? rhs[e][r] : (e ? aj.y : aj.x) + 2.0f * rhs[e][r];
+                }
+            }
+        }
+        // stage B
+        {
+            float2 vyl[R], vxl[R];
+#pragma unroll
+            for (int q = 0; q < R; ++q) {
+                vyl[q] = fa_ld2(m.vy + c + ps * (bB + 1 + q));
+                vxl[q] = fa_ld2(m.vx + c + pf * (bB + q));
+            }
+            float w[2][R + 6];
+            float yd[2][R + 3], ya[2][R + 3];
+            float ax[2][R];
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+#pragma unroll
+                for (int q = 0; q < 3; ++q) {
+                    w[e][q] = 0.0f;
+                    w[e][q + 3] = rb[e][q];
+                    yd[e][q] = ydB[e][q];
+                    ya[e][q] = yaB[e][q];
+                    ax[e][q] = kc[e][q];
+                }
+#pragma unroll
+                for (int q = 0; q < R; ++q) {
+                    w[e][q + 6] = uA[e][q];
+                }
+#pragma unroll
+                for (int q = 3; q < R; ++q) {
+                    ax[e][q] = auxA[e][q - 3];
+                }
+#pragma unroll
+                for (int q = 0; q < 3; ++q) {
+                    kc[e][q] = auxA[e][R - 3 + q];
+                    rb[e][q] = uA[e][R - 3 + q];
+                }
+            }
+            float rhs[2][R];
+            fa_lp_rhs<NW, R>(t, p, w, yd, ya, vyl, vxl, xb, fd, fa, rhs);
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+#pragma unroll
+                for (int q = 0; q < 3; ++q) {
+                    ydB[e][q] = yd[e][R + q];
+                    yaB[e][q] = ya[e][R + q];
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const int j = bB + r;
+                const float2 bj = fa_ld2(m.base + c + ps * j);
+                float o[2], na[2];
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    const float b = e ? bj.y : bj.x;
+                    if (PAIR == 0) {
+                        na[e] = ax[e][r] + 2.0f * rhs[e][r];
+                        o[e] = b + p.dt_half * rhs[e][r];
+                    } else {
+                        o[e] = b + p.dt_over_6 * (ax[e][r] + rhs[e][r]);
+                        na[e] = 0.0f;
+                    }
+                }
+                if (j < y1) {
+                    const bool o0 = c >= c0 && c < c_hi;
+                    const bool o1 = c + 1 >= c0 && c + 1 < c_hi;
+                    float *po = m.out + c + ps * j;
+                    float *pa = m.acc + c + ps * j;
+                    if (o0 && o1) {
+                        *reinterpret_cast<float2 *>(po) = make_float2(o[0], o[1]);
+                        if (PAIR == 0) {
+                            *reinterpret_cast<float2 *>(pa) = make_float2(na[0], na[1]);
+                        }
+                    } else if (o0 || o1) {
+                        const int e = o0 ? 0 : 1;
+                        po[e] = o[e];
+                        if (PAIR == 0) {
+                            pa[e] = na[e];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+}
+
+// Rim tiles of "lean2" (general rows, two stages).  fa_rim_rhs: rhs of the
+// cells of a target region from an input field held in shared
+// memory (origin (gi0, gj0), pitch IW), with the general operator rows.
+// Faces go through shared scratch arrays fxd/fxa (TH x (TW + 8)) and fyd/fya
+// ((TH + 8) x TW).  rhs is written to out[(j - tj0) * TW + (i - ti0)].
+template <int TW, int TH, int IW>
+__device__ __forceinline__ void fa_rim_rhs(const float *in2d, int gi0, int gj0, int ti0, int tj0,
+    const fa_lptr_t &m, const fa_step_params_t &p, float *fxd, float *fxa, float *fyd,
+    float *fya, float *out)
+{
+    constexpr int NT = 256;
+    const int tid = threadIdx.x;
+    const int nx = p.nx;
+    const int ny = p.ny;
+    // x faces f = ti0 - 4 + lf (lf < TW + 8), rows j = tj0 + r (r < TH)
+    for (int q = tid; q < TH * (TW + 8); q += NT) {
+        const int lf = q % (TW + 8);
+        const int r = q / (TW + 8);
+        const int f = ti0 - 4 + lf;
+        const int j = tj0 + r;
+        float d = 0.0f, a = 0.0f;
+        if (f >= 0 && f <= nx && j >= 0 && j <= ny + 1) {
+            const fa_sline_t line = {in2d + (j - gj0) * IW, gi0, 1};
+            d = 0.5f * fa_t_grad(line, nx + 2, f, p.inv_dx);
+            a = m.vx[f + m.pf * j] * fa_t_interp(line, nx + 2, f);
+        }
+        fxd[q] = d;
+        fxa[q] = a;
+    }
+    // y faces g = tj0 - 4 + lg (lg < TH + 8), columns i = ti0 + l (l < TW)
+    for (int q = tid; q < (TH + 8) * TW; q += NT) {
+        const int l = q % TW;
+        const int lg = q / TW;
+        const int g = tj0 - 4 + lg;
+        const int i = ti0 + l;
+        float d = 0.0f, a = 0.0f;
+        if (g >= 0 && g <= ny && i >= 0 && i <= nx + 1) {
+            const fa_sline_t line = {in2d + (i - gi0), gj0, IW};
+            d = 0.5f * fa_t_grad(line, ny + 2, g, p.inv_dy);
+            a = m.vy[i + m.ps * g] * fa_t_interp(line, ny + 2, g);
+        }
+        fyd[q] = d;
+        fya[q] = a;
+    }
+    __syncthreads();
+    for (int q = tid; q < TH * TW; q += NT) {
+        const int l = q % TW;
+        const int r = q / TW;
+        const int i = ti0 + l;
+        const int j = tj0 + r;
+        float rhs = 0.0f;
+        if (i >= 1 && i <= nx && j >= 1 && j <= ny) {
+            const fa_sline_t xd = {fxd + r * (TW + 8), ti0 - 4, 1};
+            const fa_sline_t xa = {fxa + r * (TW + 8), ti0 - 4, 1};
+            const fa_sline_t yd = {fyd + l, tj0 - 4, TW};
+            const fa_sline_t ya = {fya + l, tj0 - 4, TW};
+            const float diffx = fa_t_div(xd, nx + 1, i - 1, p.inv_dx);
+            const float diffy = fa_t_div(yd, ny + 1, j - 1, p.inv_dy);
+            const float advx = fa_t_div(xa, nx + 1, i - 1, p.inv_dx);
+            const float advy = fa_t_div(ya, ny + 1, j - 1, p.inv_dy);
+            rhs = (diffx + diffy) - (advx + advy);
+        }
+        out[q] = rhs;
+    }
+    __syncthreads();
+}
+
+struct fa_rim_bands_t {
+    int n;
+    int c_lo[4], c_hi[4], r_lo[4], r_hi[4];
+    int tiles_x[4];
+    int first[5];
+};
+
+template <int PAIR, int TX, int TY>
+__device__ __forceinline__ void fa_rim_tile(const fa_lptr_t &m, const fa_step_params_t &p,
+    const fa_rim_bands_t &bands, int blk, float *smem)
+{
+    constexpr int IW = TX + 12, IH = TY + 12;       // input region
+    constexpr int AW = TX + 6, AH = TY + 6;         // stage-A region
+    int q = 0;
+    while (q + 1 < bands.n && blk >= bands.first[q + 1]) {
+        ++q;
+    }
+    const int k = blk - bands.first[q];
+    const int i0 = bands.c_lo[q] + TX * (k % bands.tiles_x[q]);
+    const int j0 = bands.r_lo[q] + TY * (k / bands.tiles_x[q]);
+    const int nx = p.nx;
+    const int ny = p.ny;
+    const int ps = m.ps;
+    const int tid = threadIdx.x;
+    float *s = smem;                              // IH x IW input
+    float *ua = s + IH * IW;                      // AH x AW stage-A values
+    float *xa = ua + AH * AW;                     // AH x AW stage-A aux
+    float *rb = xa + AH * AW;                     // AH x AW rhs scratch
+    float *fxd = rb + AH * AW;                    // AH x (AW + 8)
+    float *fxa = fxd + AH * (AW + 8);
+    float *fyd = fxa + AH * (AW + 8);             // (AH + 8) x AW
+    float *fya = fyd + (AH + 8) * AW;
+    for (int t = tid; t < IH * IW; t += 256) {
+        const int gi = i0 - 6 + t % IW;
+        const int gj = j0 - 6 + t / IW;
+        s[t] = gi >= 0 && gi <= nx + 1 && gj >= 0 && gj <= ny + 1 ? m.in[gi + ps * gj] : 0.0f;
+    }
+    __syncthreads();
+    // stage A on [i0-3, i0+TX+3) x [j0-3, j0+TY+3)
+    fa_rim_rhs<AW, AH, IW>(s, i0 - 6, j0 - 6, i0 - 3, j0 - 3, m, p, fxd, fxa, fyd, fya, rb);
+    const float alA = PAIR == 0 ? p.dt_half : p.dt;
+    for (int t = tid; t < AH * AW; t += 256) {
+        const int gi = i0 - 3 + t % AW;
+        const int gj = j0 - 3 + t / AW;
+        float u = 0.0f, x = 0.0f;
+        if (gi >= 0 && gi <= nx + 1 && gj >= 0 && gj <= ny + 1) {
+            const float b = m.base[gi + ps * gj];
+            if (gi >= 1 && gi <= nx && gj >= 1 && gj <= ny) {
+                u = b + alA * rb[t];
+                x = PAIR == 0 ? rb[t] : m.acc[gi + ps * gj] + 2.0f * rb[t];
+            } else {
+                u = b;          // fixed boundary point
+            }
+        }
+        ua[t] = u;
+        xa[t] = x;
+    }
+    __syncthreads();
+    // stage B on the tile
+    fa_rim_rhs<TX, TY, AW>(ua, i0 - 3, j0 - 3, i0, j0, m, p, fxd, fxa, fyd, fya, rb);
+    for (int t = tid; t < TX * TY; t += 256) {
+        const int gi = i0 + t % TX;
+        const int gj = j0 + t / TX;
+        if (gi >= bands.c_hi[q] || gj >= bands.r_hi[q]) {
+            continue;
+        }
+        const int idx = gi + ps * gj;
+        const float b = m.base[idx];
+        const float ax = xa[(gj - j0 + 3) * AW + (gi - i0 + 3)];
+        const float rhs = rb[t];
+        if (PAIR == 0) {
+            m.acc[idx] = ax + 2.0f * rhs;
+            m.out[idx] = b + p.dt_half * rhs;
+        } else {
+            m.out[idx] = b + p.dt_over_6 * (ax + rhs);
+        }
+    }
+}
+
+// Shared floats of a rim tile: input, stage-A values, aux and rhs, faces.
+__host__ __device__ constexpr int fa_rim_smem(int tx, int ty)
+{
+    return (tx + 12) * (ty + 12) + 3 * (tx + 6) * (ty + 6) + 2 * (ty + 6) * (tx + 14) +
+        2 * (ty + 14) * (tx + 6);
+}
+
+// One grid per pair: 32 x 6 tiles along the top and bottom, 8 x 32 tiles
+// along the sides (clipped to their bands).
+template <int PAIR>
+__global__ void __launch_bounds__(256)
+fa_rim_pair(fa_lptr_t m, fa_step_params_t p, fa_rim_bands_t bands, fa_rim_bands_t sides)
+{
+    constexpr int A = fa_rim_smem(32, 6);
+    constexpr int B = fa_rim_smem(8, 32);
+    __shared__ float smem[A > B ? A : B];
+    asm volatile("griddepcontrol.launch_dependents;");
+    const int nb = bands.first[bands.n];
+    if ((int)blockIdx.x < nb) {
+        fa_rim_tile<PAIR, 32, 6>(m, p, bands, (int)blockIdx.x, smem);
+    } else {
+        fa_rim_tile<PAIR, 8, 32>(m, p, sides, (int)blockIdx.x - nb, smem);
+    }
+}
+
+static fa_rim_bands_t fa_rim_make(int nx, int ny, bool sides, int tx, int ty, int col_lo,
+    int col_hi, int row_lo, int row_hi)
+{
+    fa_rim_bands_t b;
+    int k = 0;
+    const auto add = [&](int c_lo, int c_hi, int r_lo, int r_hi) {
+        if (c_hi <= c_lo || r_hi <= r_lo) {
+            return;
+        }
+        b.c_lo[k] = c_lo;
+        b.c_hi[k] = c_hi;
+        b.r_lo[k] = r_lo;
+        b.r_hi[k] = r_hi;
+        b.tiles_x[k] = (c_hi - c_lo + tx - 1) / tx;
+        ++k;
+    };
+    if (sides) {
+        add(1, col_lo, row_lo, row_hi);
+        add(col_hi, nx + 1, row_lo, row_hi);
+    } else {
+        add(1, nx + 1, 1, row_lo);
+        add(1, nx + 1, row_hi, ny + 1);
+    }
+    b.n = k;
+    b.first[0] = 0;
+    for (int q = 0; q < k; ++q) {
+        b.first[q + 1] = b.first[q] + b.tiles_x[q] * ((b.r_hi[q] - b.r_lo[q] + ty - 1) / ty);
+    }
+    for (int q = k; q < 4; ++q) {
+        b.first[q + 1] = b.first[k];
+    }
+    return b;
+}
+
+// Strips of "lean2": columns [8, nx - 5) (even first column for aligned
+// column pairs with the 6-column halo), rows [7, ny - 5); stage-1 cells of
+// the strips then stay in [5, nx - 3] x [4, ny - 3], where the interior rows
+// apply.  The rim bands take the rest (clamped for small grids).
+template <int NW>
+static void fa_launch_lean2(const fa_config_t *cfg, fa_device_t *d, int parity, int H,
+    cudaStream_t s)
+{
+    constexpr int W = 64 * NW - 12;
+    const int nx = (int)cfg->nx;
+    const int ny = (int)cfg->ny;
+    const int col_lo = 8;
+    const int col_hi = max(nx - 5, col_lo);
+    const int row_lo = 7;
+    const int row_hi = max(ny - 5, row_lo);
+    const fa_rim_bands_t bands = fa_rim_make(nx, ny, false, 32, 6, col_lo, col_hi, row_lo,
+        row_hi);
+    const fa_rim_bands_t sides = fa_rim_make(nx, ny, true, 8, 32, col_lo, col_hi, row_lo,
+        row_hi);
+    const fa_step_params_t p = fa_step_params(cfg);
+    fa_lptr_t m;
+    m.vx = d->m.vx;
+    m.vy = d->m.vy;
+    m.ps = d->m.ps;
+    m.pf = d->m.pf;
+    m.acc = d->m.acc;
+    m.base = d->m.base[parity];
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t lc = {};
+    lc.gridDim = dim3((col_hi - col_lo + W - 1) / W, (row_hi - row_lo + H - 1) / H, 1);
+    lc.blockDim = dim3(32 * NW, 1, 1);
+    lc.stream = s;
+    lc.attrs = attr;
+    lc.numAttrs = 1;
+    const bool strips = col_hi > col_lo && row_hi > row_lo;
+    const int nrim = bands.first[bands.n] + sides.first[sides.n];
+    m.in = d->m.base[parity];
+    m.out = d->m.stage[0];
+    fa_rim_pair<0><<<nrim, 256, 0, s>>>(m, p, bands, sides);
+    if (strips) {
+        fa_cuda_check(cudaLaunchKernelEx(&lc, fa_lpair<NW, 0>, m, p, col_lo, col_hi, row_lo,
+            row_hi, H), "lean2 launch");
+    }
+    m.in = d->m.stage[0];
+    m.out = d->m.base[parity ^ 1];
+    fa_rim_pair<1><<<nrim, 256, 0, s>>>(m, p, bands, sides);
+    if (strips) {
+        fa_cuda_check(cudaLaunchKernelEx(&lc, fa_lpair<NW, 1>, m, p, col_lo, col_hi, row_lo,
+            row_hi, H), "lean2 launch");
+    }
+}
+
 // Launch one timestep.  Only the "pair" variant alternates base buffers by
 // parity; the others always update d->base in place.
 static void fa_launch_step(const fa_options_t *opt, fa_device_t *d, int parity,
@@ -3346,6 +3934,14 @@ static void fa_launch_step(const fa_options_t *opt, fa_device_t *d, int parity,
         default: fa_die("unsupported lean --block (64, 96 or 128)");
         }
         break;
+    case FA_KERNEL_LEAN2:
+        switch (opt->block_x) {
+        case 64: fa_launch_lean2<2>(cfg, d, parity, (int)opt->tile_y, s); break;
+        case 96: fa_launch_lean2<3>(cfg, d, parity, (int)opt->tile_y, s); break;
+        case 128: fa_launch_lean2<4>(cfg, d, parity, (int)opt->tile_y, s); break;
+        default: fa_die("unsupported lean2 --block (64, 96 or 128)");
+        }
+        break;
     default:
         fa_die("unsupported kernel variant");
     }
@@ -3380,7 +3976,7 @@ static void fa_upload_state(const fa_config_t *cfg, const fa_fields_t *fields,
 
 // Resolve --kernel auto and fill in the tuned launch geometry of each
 // variant where --block/--tile-x/--tile-y were not given.  "auto" selects
-// "lean" while the six full-size fields of the per-stage scheme (base, two
+// "lean2" while the six full-size fields of the per-stage scheme (base, two
 // stage buffers, accumulator, both velocities) fit in the L2 cache, and
 // "march" (one fused kernel per timestep, about a fifth of the global traffic
 // of "pair") once they do not.
@@ -3389,7 +3985,7 @@ static void fa_resolve_kernel(fa_options_t *opt, size_t scalar_bytes)
     if (opt->kernel == FA_KERNEL_AUTO) {
         int l2 = 0;
         fa_cuda_check(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, 0), "L2 size");
-        opt->kernel = 6 * scalar_bytes <= (size_t)l2 ? FA_KERNEL_LEAN : FA_KERNEL_MARCH;
+        opt->kernel = 6 * scalar_bytes <= (size_t)l2 ? FA_KERNEL_LEAN2 : FA_KERNEL_MARCH;
     }
     uint32_t bx = 32, by = 8, tx = 32, ty = 16;
     switch (opt->kernel) {
@@ -3404,6 +4000,13 @@ static void fa_resolve_kernel(fa_options_t *opt, size_t scalar_bytes)
         by = 1;
         tx = 2 * bx - 6;
         ty = bx == 96 ? 32 : 24;
+        break;
+    case FA_KERNEL_LEAN2:
+        // Tuned at 2048^2 (64 threads, 64 rows) and 1024^2 (64, 24).
+        bx = 64;
+        by = 1;
+        tx = 2 * bx - 12;
+        ty = (uint64_t)opt->cfg.nx * opt->cfg.ny >= 2000000 ? 64 : 24;
         break;
     default: break;
     }
@@ -3436,15 +4039,15 @@ static void fa_resolve_kernel(fa_options_t *opt, size_t scalar_bytes)
             opt->tile_y = 24;
         }
     }
-    if (opt->kernel == FA_KERNEL_LEAN) {
+    if (opt->kernel == FA_KERNEL_LEAN || opt->kernel == FA_KERNEL_LEAN2) {
         if (opt->block_x != 64 && opt->block_x != 96 && opt->block_x != 128) {
-            fa_die("lean supports --block 64, 96 or 128");
+            fa_die("lean and lean2 support --block 64, 96 or 128");
         }
         if (opt->tile_y % FA_M_R != 0 || opt->tile_y < 8) {
-            fa_die("lean requires --tile-y a multiple of 8");
+            fa_die("lean and lean2 require --tile-y a multiple of 8");
         }
         opt->block_y = 1;
-        opt->tile_x = 2 * opt->block_x - 6;
+        opt->tile_x = 2 * opt->block_x - (opt->kernel == FA_KERNEL_LEAN ? 6 : 12);
     }
     if ((uint64_t)opt->block_x * opt->block_y > 1024) {
         fa_die("block exceeds 1024 threads");
@@ -3484,7 +4087,8 @@ static void fa_run_cuda(const fa_options_t *opt, fa_fields_t *fields,
     }
     fa_cuda_check(cudaMemcpy(d.vx, fields->vx, xb, cudaMemcpyHostToDevice), "upload vx");
     fa_cuda_check(cudaMemcpy(d.vy, fields->vy, yb, cudaMemcpyHostToDevice), "upload vy");
-    if (opt->kernel == FA_KERNEL_MARCH || opt->kernel == FA_KERNEL_LEAN) {
+    if (opt->kernel == FA_KERNEL_MARCH || opt->kernel == FA_KERNEL_LEAN ||
+        opt->kernel == FA_KERNEL_LEAN2) {
         const size_t nx = opt->cfg.nx;
         const size_t ny = opt->cfg.ny;
         const size_t pad = FA_M_PAD;
@@ -3493,7 +4097,7 @@ static void fa_run_cuda(const fa_options_t *opt, fa_fields_t *fields,
         const size_t rows = ny + 2 + 2 * pad;
         const size_t sbytes = (size_t)d.m.ps * rows * sizeof(float);
         const size_t fbytes = (size_t)d.m.pf * rows * sizeof(float);
-        const int nalloc = opt->kernel == FA_KERNEL_LEAN ? 7 : 4;
+        const int nalloc = opt->kernel == FA_KERNEL_MARCH ? 4 : 7;
         for (int k = 0; k < nalloc; ++k) {
             const size_t bytes = k == 2 ? fbytes : sbytes;
             fa_cuda_check(cudaMalloc((void **)&d.m.alloc[k], bytes), "malloc padded");
@@ -3576,7 +4180,8 @@ static void fa_run_cuda(const fa_options_t *opt, fa_fields_t *fields,
     fa_cuda_check(cudaGetLastError(), "solve launch");
     fa_cuda_check(cudaEventRecord(ev_end, stream), "record end");
     const float *final_base = (d.base_alt && (opt->cfg.steps & 1u)) ? d.base_alt : d.base;
-    if (opt->kernel == FA_KERNEL_MARCH || opt->kernel == FA_KERNEL_LEAN) {
+    if (opt->kernel == FA_KERNEL_MARCH || opt->kernel == FA_KERNEL_LEAN ||
+        opt->kernel == FA_KERNEL_LEAN2) {
         const size_t row = ((size_t)opt->cfg.nx + 2) * sizeof(float);
         fa_cuda_check(cudaMemcpy2DAsync(fields->base, row, d.m.base[opt->cfg.steps & 1u],
             (size_t)d.m.ps * sizeof(float), row, (size_t)opt->cfg.ny + 2,
@@ -3633,7 +4238,7 @@ static void fa_usage(const char *argv0)
     fprintf(stderr,
         "usage: %s [--mode cpu|cuda] [--cells nx,ny] [--steps n] [--dt dt]\n"
         "          [--input path] [--output path] [--dump [path]] [--dump-bin [path]]\n"
-        "          [--kernel auto|split|fused|tiled|prefetch|regy|regyf|pair|march|lean] [--block x[,y]]\n"
+        "          [--kernel auto|split|fused|tiled|prefetch|regy|regyf|pair|march|lean|lean2] [--block x[,y]]\n"
         "          [--tile-x n] [--tile-y n] [--frame-parts n] [--graph on|off]\n",
         argv0);
 }

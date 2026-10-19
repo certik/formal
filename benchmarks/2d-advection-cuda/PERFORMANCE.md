@@ -82,10 +82,11 @@ validated (see [Validation](#validation)).  Solve-wall medians of 5 runs:
 | `regyf` | 0.0430 | **0.1164** | 1.1603 | boundary tiles moved to a separate, concurrent frame kernel; the interior kernel drops all general code (66 → 40 registers); frame tiles split into 32 x 8 blocks (1024²: 0.0546 → 0.0430) |
 | `pair` | 0.0774 | 0.1786 | 0.6745 | two RK stages per kernel with halo recomputation; stage-1/3 fields never leave the chip; half the DRAM traffic per step |
 | `march` | 0.0977 | 0.1209 | **0.3590** | one kernel per timestep (all four stages): blocks march down column strips with a register pipeline in y; only base and the velocities are read and base written per step (see below) |
-| `lean` | **0.0399** | **0.0866** | 1.1984 | one kernel per stage with the `march` thread layout and padded fields: every field read once (plus a 3-row halo of the stage input), boundary rim in a concurrent kernel overlapped by programmatic dependent launch (see below) |
-| `auto` (default) | 0.0399 | 0.0866 | 0.3590 | `lean` if 6 fields fit in L2, else `march` |
+| `lean` | 0.0399 | 0.0866 | 1.1984 | one kernel per stage with the `march` thread layout and padded fields: every field read once (plus a 3-row halo of the stage input), boundary rim in a concurrent kernel overlapped by programmatic dependent launch (see below) |
+| `lean2` | **0.0322** | **0.0682** | 0.6320 | `lean` with two stages per kernel (1+2, 3+4): the stage-1/3 values, rates and accumulator stay on chip, about 11 instead of 26 field accesses per step (see below) |
+| `auto` (default) | 0.0322 | 0.0682 | 0.3590 | `lean2` if 6 fields fit in L2, else `march` |
 
-Speed-up of the default over LFortran Formal: **6.6x at 2048²** and 2.3x at
+Speed-up of the default over LFortran Formal: **8.3x at 2048²** and 2.9x at
 1024².  CUDA Graphs (one graph per timestep) made no measurable difference
 (`split` 0.5583 vs 0.5590 s, `fused` 0.2083 vs 0.2095 s, graph off vs on):
 launches are asynchronous and there is no host synchronization inside the
@@ -183,6 +184,28 @@ slower; merging the rim tiles into the interior grid raised its registers
 (0.109 s).  Sweep at 2048² (block threads / rows per segment, s): 96/32
 0.0888, 64/32 0.0922, 64/48 0.0946, 96/48 0.0958, 96/40 0.0959, 128/32
 0.106; 1024²: 64/24 0.0408, 96/32 0.0446.
+
+### `lean2`: two stages per kernel
+
+`lean` sits at the L2 roof of the per-stage scheme, so the next step is
+fewer passes.  `lean2` fuses the stages in pairs like `pair`, but with the
+`lean` structure: a strip (2*NT - 12 columns plus a 6-column halo on each
+side) marches down its segment with the second stage three rows behind the
+first, both stages carrying their stage values and y faces in registers; a
+prologue evaluates the first stage on the six rows around the segment start,
+so beyond the 6-row halo of the stage input nothing is loaded or computed
+twice.  The rim (cells within 6-7 cells of a boundary: 32 x 6 tiles along
+the top and bottom, 8 x 32 tiles along the sides) evaluates both stages with
+the general rows in shared memory (the first one on the tile extended by
+three cells), in a grid launched before the strips with the same
+programmatic-launch overlap as `lean`.  Per step at 2048²: 310 MB of L2
+traffic (`lean` 510 MB, `regyf` 619 MB), 46 M warp instructions, 34 MB DRAM
+write-back; 0.0682 s for 1000 steps (`lean` 0.0892 s, interleaved, 5 runs
+each).  166-168 registers; the strip kernel issues on ~37% of the cycles
+and runs L2 at ~4.5 TB/s, so it is neither purely bandwidth nor purely
+latency bound.  Sweeps (block threads / rows per segment, s): 2048² 64/64
+0.0696, 96/32 0.0715, 128/64 0.0716, 64/72 0.0730, 64/40 0.0735; 1024²
+64/24 0.0325, 64/16 0.0346, 96/32 0.0347.
 
 Rejected experiments (in commit `d353184`): a shared-memory-free "stream"
 kernel (warps walking 26-column strips with shuffles in x and a register
