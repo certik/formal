@@ -64,6 +64,7 @@ typedef enum {
     FA_KERNEL_REGYF,
     FA_KERNEL_PAIR,
     FA_KERNEL_MARCH,
+    FA_KERNEL_LEAN,
     FA_KERNEL_AUTO,
     FA_KERNEL_COUNT_
 } fa_kernel_t;
@@ -77,6 +78,7 @@ static const char *FA_KERNEL_NAMES[FA_KERNEL_COUNT_] = {
     "regyf",
     "pair",
     "march",
+    "lean",
     "auto",
 };
 
@@ -866,14 +868,17 @@ __global__ void fa_split_update(float *base, float *stage_out, float *accum,
 // ---------------------------------------------------------------------------
 
 // Padded device copies of base (double-buffered) and the velocities used by
-// "march": FA_M_PAD ghost points (zeros) on every side, pitches rounded up to
-// 32 floats; base[k], vx and vy point at element (0, 0).
+// "march" and "lean" (plus the stage buffers and accumulator of "lean"):
+// FA_M_PAD ghost points (zeros) on every side, pitches rounded up to 32
+// floats; the pointers address element (0, 0).
 constexpr int FA_M_PAD = 32;
 typedef struct {
-    float *alloc[4];
+    float *alloc[7];
     float *base[2];
     float *vx;
     float *vy;
+    float *stage[2];    // "lean" only
+    float *acc;         // "lean" only
     int ps;
     int pf;
 } fa_mfields_t;
@@ -2795,6 +2800,443 @@ static void fa_launch_march(const fa_config_t *cfg, fa_device_t *d, int parity, 
     }
 }
 
+// Variant "lean": one kernel per RK stage like "regyf", with the "march"
+// thread layout.  The interior rectangle of the domain is cut into strips of
+// W = 2*NT - 6 columns (NT threads, each owning two adjacent columns, plus a
+// 3-column halo on each side) and segments of H rows.  A block marches down
+// its segment in chunks of 8 rows: the y direction stays in registers (three
+// stage values and three y faces carried from chunk to chunk, one new face
+// per cell), the x direction goes through shared memory as float2.  The
+// stage input is read with a 3-row halo above and below the segment only,
+// every other field exactly once, all with aligned 64-bit loads from the
+// padded layout, so the L2 traffic per stage is close to the 7 field
+// accesses the method needs (read in, base, accumulator and both
+// velocities, write the stage value and the accumulator).  The boundary
+// bands (32 columns at each side, 8 rows at top and bottom) run concurrently
+// as 32 x 8 tiles with the general operator rows.  base is double-buffered
+// (stage 4 writes the other buffer) because neighbouring blocks read its
+// halo.
+struct fa_lptr_t {
+    const float *in;
+    const float *base;
+    float *out;         // stage value, or the new base for stage 4
+    float *acc;
+    const float *vx;
+    const float *vy;
+    int ps;             // pitch of the scalars and vy
+    int pf;             // pitch of vx
+};
+
+// Interior rectangle of "lean": columns [5, nx - 2), rows [4, ny - 2) (all
+// cells whose operator rows are the interior ones, the first column kept
+// odd for aligned column pairs).
+struct fa_lean_geo_t {
+    int col_lo;
+    int col_hi;
+    int row_lo;
+    int row_hi;
+};
+
+static bool fa_lean_geo(int nx, int ny, fa_lean_geo_t *g)
+{
+    g->col_lo = 5;
+    g->col_hi = nx - 2;
+    g->row_lo = 4;
+    g->row_hi = ny - 2;
+    return g->col_hi > g->col_lo + 8 && g->row_hi > g->row_lo + 8;
+}
+
+template <int S>
+__device__ __forceinline__ void fa_lean_update(float rhs, float bj, float aj,
+    const fa_step_params_t &p, float &out, float &acc)
+{
+    if (S == 1) {
+        acc = rhs;
+        out = bj + p.dt_half * rhs;
+    } else if (S == 2) {
+        acc = aj + 2.0f * rhs;
+        out = bj + p.dt_half * rhs;
+    } else if (S == 3) {
+        acc = aj + 2.0f * rhs;
+        out = bj + p.dt * rhs;
+    } else {
+        out = bj + p.dt_over_6 * (aj + rhs);
+    }
+}
+
+template <int NW, int S>
+__global__ void __launch_bounds__(32 * NW)
+fa_lean_stage(fa_lptr_t m, fa_step_params_t p, fa_lean_geo_t geo, int H)
+{
+    constexpr int R = FA_M_R;
+    constexpr int NT = 32 * NW;
+    constexpr int W = 2 * NT - 6;
+    __shared__ __align__(16) float xb[R][2 * NT + 8];
+    __shared__ __align__(16) float fd[R][2 * NT + 8];
+    __shared__ __align__(16) float fa[R][2 * NT + 8];
+    const int t = threadIdx.x;
+    for (int q = t; q < R * (2 * NT + 8); q += NT) {
+        (&xb[0][0])[q] = 0.0f;
+        (&fd[0][0])[q] = 0.0f;
+        (&fa[0][0])[q] = 0.0f;
+    }
+    __syncthreads();
+    const int c0 = geo.col_lo + (int)blockIdx.x * W;     // odd
+    const int y0 = geo.row_lo + (int)blockIdx.y * H;
+    const int y1 = min(y0 + H, geo.row_hi);
+    const int c_hi = min(c0 + W, geo.col_hi);
+    const int c = c0 - 3 + 2 * t;                         // even
+    const int ps = m.ps;
+    // Prologue: carried rows [y0, y0 + 3) and y faces [y0 - 2, y0 + 1).
+    float rc[2][3], ydc[2][3], yac[2][3];
+    {
+        float2 pr[6];
+#pragma unroll
+        for (int q = 0; q < 6; ++q) {
+            pr[q] = fa_ld2(m.in + c + ps * (y0 - 3 + q));
+        }
+#pragma unroll
+        for (int q = 0; q < 3; ++q) {
+            const float2 v = fa_ld2(m.vy + c + ps * (y0 - 2 + q));
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const float s0 = e ? pr[q].y : pr[q].x;
+                const float s1 = e ? pr[q + 1].y : pr[q + 1].x;
+                const float s2 = e ? pr[q + 2].y : pr[q + 2].x;
+                const float s3 = e ? pr[q + 3].y : pr[q + 3].x;
+                ydc[e][q] = fa_hgrad_interior(s0, s1, s2, s3, p.inv_dy);
+                yac[e][q] = (e ? v.y : v.x) * fa_interp_interior(s0, s1, s2, s3);
+                rc[e][q] = s3;
+            }
+        }
+    }
+    const int K = (y1 - y0 + R - 1) / R;
+    for (int k = 0; k < K; ++k) {
+        const int b = y0 + k * R;       // output rows [b, b + R)
+        // All global loads of the chunk first.
+        float2 cur[R], vyl[R], vxl[R], bl[R], al[R];
+#pragma unroll
+        for (int q = 0; q < R; ++q) {
+            cur[q] = fa_ld2(m.in + c + ps * (b + 3 + q));
+            vyl[q] = fa_ld2(m.vy + c + ps * (b + 1 + q));
+            vxl[q] = fa_ld2(m.vx + c + m.pf * (b + q));
+            bl[q] = fa_ld2(m.base + c + ps * (b + q));
+            al[q] = S > 1 ? fa_ld2(m.acc + c + ps * (b + q)) : make_float2(0.0f, 0.0f);
+        }
+        float w[2][R + 3];
+        float yd[2][R + 3];
+        float ya[2][R + 3];
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+#pragma unroll
+            for (int q = 0; q < 3; ++q) {
+                w[e][q] = rc[e][q];
+                yd[e][q] = ydc[e][q];
+                ya[e][q] = yac[e][q];
+            }
+#pragma unroll
+            for (int q = 0; q < R; ++q) {
+                w[e][q + 3] = e ? cur[q].y : cur[q].x;
+            }
+#pragma unroll
+            for (int q = 0; q < 3; ++q) {
+                rc[e][q] = w[e][R + q];
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            *reinterpret_cast<float2 *>(&xb[r][2 * t + 4]) = make_float2(w[0][r], w[1][r]);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int q = 0; q < R; ++q) {
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                yd[e][q + 3] = fa_hgrad_interior(w[e][q], w[e][q + 1], w[e][q + 2],
+                    w[e][q + 3], p.inv_dy);
+                ya[e][q + 3] = (e ? vyl[q].y : vyl[q].x) * fa_interp_interior(w[e][q],
+                    w[e][q + 1], w[e][q + 2], w[e][q + 3]);
+            }
+        }
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+#pragma unroll
+            for (int q = 0; q < 3; ++q) {
+                ydc[e][q] = yd[e][R + q];
+                yac[e][q] = ya[e][R + q];
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const float sm = xb[r][2 * t + 3];
+            const float2 sp = *reinterpret_cast<const float2 *>(&xb[r][2 * t + 6]);
+            const float d0 = fa_hgrad_interior(sm, w[0][r], w[1][r], sp.x, p.inv_dx);
+            const float d1 = fa_hgrad_interior(w[0][r], w[1][r], sp.x, sp.y, p.inv_dx);
+            const float a0 = vxl[r].x * fa_interp_interior(sm, w[0][r], w[1][r], sp.x);
+            const float a1 = vxl[r].y * fa_interp_interior(w[0][r], w[1][r], sp.x, sp.y);
+            *reinterpret_cast<float2 *>(&fd[r][2 * t + 4]) = make_float2(d0, d1);
+            *reinterpret_cast<float2 *>(&fa[r][2 * t + 4]) = make_float2(a0, a1);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int j = b + r;
+            const float2 dm = *reinterpret_cast<const float2 *>(&fd[r][2 * t + 2]);
+            const float2 d0 = *reinterpret_cast<const float2 *>(&fd[r][2 * t + 4]);
+            const float dp = fd[r][2 * t + 6];
+            const float2 am = *reinterpret_cast<const float2 *>(&fa[r][2 * t + 2]);
+            const float2 a0 = *reinterpret_cast<const float2 *>(&fa[r][2 * t + 4]);
+            const float ap = fa[r][2 * t + 6];
+            float diffx[2], advx[2];
+            diffx[0] = fa_div_interior(dm.x, dm.y, d0.x, d0.y, p.inv_dx);
+            diffx[1] = fa_div_interior(dm.y, d0.x, d0.y, dp, p.inv_dx);
+            advx[0] = fa_div_interior(am.x, am.y, a0.x, a0.y, p.inv_dx);
+            advx[1] = fa_div_interior(am.y, a0.x, a0.y, ap, p.inv_dx);
+            float o[2], na[2];
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const float diffy = fa_div_interior(yd[e][r], yd[e][r + 1], yd[e][r + 2],
+                    yd[e][r + 3], p.inv_dy);
+                const float advy = fa_div_interior(ya[e][r], ya[e][r + 1], ya[e][r + 2],
+                    ya[e][r + 3], p.inv_dy);
+                const float rhs = (diffx[e] + diffy) - (advx[e] + advy);
+                fa_lean_update<S>(rhs, e ? bl[r].y : bl[r].x, e ? al[r].y : al[r].x, p,
+                    o[e], na[e]);
+            }
+            if (j < y1) {
+                const bool o0 = c >= c0 && c < c_hi;
+                const bool o1 = c + 1 >= c0 && c + 1 < c_hi;
+                float *po = m.out + c + ps * j;
+                float *pa = m.acc + c + ps * j;
+                if (o0 && o1) {
+                    *reinterpret_cast<float2 *>(po) = make_float2(o[0], o[1]);
+                    if (S < 4) {
+                        *reinterpret_cast<float2 *>(pa) = make_float2(na[0], na[1]);
+                    }
+                } else if (o0 || o1) {
+                    const int e = o0 ? 0 : 1;
+                    po[e] = o[e];
+                    if (S < 4) {
+                        pa[e] = na[e];
+                    }
+                }
+            }
+        }
+    }
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+}
+
+// Boundary bands of "lean": tiles with the general operator rows
+// (fa_tile_general on the padded layout), clipped to their band.  Bands:
+// top rows [1, row_lo) and bottom rows [row_hi, ny] in 64 x 3 tiles, left
+// columns [1, col_lo) and right columns [col_hi, nx] (between row_lo and
+// row_hi) in 4 x 48 tiles; with an empty interior the whole domain is one
+// band of 64 x 3 tiles.
+struct fa_lean_bands_t {
+    int n;              // number of bands
+    int c_lo[4], c_hi[4], r_lo[4], r_hi[4];
+    int tiles_x[4];
+    int first[5];       // first block of each band
+};
+
+static fa_lean_bands_t fa_lean_bands(int nx, int ny, bool sides, int tx, int ty)
+{
+    fa_lean_bands_t b;
+    fa_lean_geo_t g;
+    int k = 0;
+    const auto add = [&](int c_lo, int c_hi, int r_lo, int r_hi) {
+        if (c_hi <= c_lo || r_hi <= r_lo) {
+            return;
+        }
+        b.c_lo[k] = c_lo;
+        b.c_hi[k] = c_hi;
+        b.r_lo[k] = r_lo;
+        b.r_hi[k] = r_hi;
+        b.tiles_x[k] = (c_hi - c_lo + tx - 1) / tx;
+        ++k;
+    };
+    if (fa_lean_geo(nx, ny, &g)) {
+        if (sides) {
+            add(1, g.col_lo, g.row_lo, g.row_hi);
+            add(g.col_hi, nx + 1, g.row_lo, g.row_hi);
+        } else {
+            add(1, nx + 1, 1, g.row_lo);
+            add(1, nx + 1, g.row_hi, ny + 1);
+        }
+    } else if (!sides) {
+        add(1, nx + 1, 1, ny + 1);
+    }
+    b.n = k;
+    b.first[0] = 0;
+    for (int q = 0; q < k; ++q) {
+        b.first[q + 1] = b.first[q] + b.tiles_x[q] * ((b.r_hi[q] - b.r_lo[q] + ty - 1) / ty);
+    }
+    for (int q = k; q < 4; ++q) {
+        b.first[q + 1] = b.first[k];
+    }
+    return b;
+}
+
+template <int STAGE, int TX, int TY>
+__device__ __forceinline__ void fa_lean_tile(const fa_lptr_t &m, const fa_step_params_t &p,
+    const fa_lean_bands_t &bands, int blk)
+{
+    constexpr int SW = TX + 8;
+    constexpr int SH = TY + 8;
+    constexpr int FXW = TX + 5;
+    constexpr int FYH = TY + 5;
+    __shared__ float s[SH][SW];
+    __shared__ float fxd[TY][FXW];
+    __shared__ float fxa[TY][FXW];
+    __shared__ float fyd[FYH][TX];
+    __shared__ float fya[FYH][TX];
+    int q = 0;
+    while (q + 1 < bands.n && blk >= bands.first[q + 1]) {
+        ++q;
+    }
+    const int k = blk - bands.first[q];
+    const int i0 = bands.c_lo[q] + TX * (k % bands.tiles_x[q]);
+    const int j0 = bands.r_lo[q] + TY * (k / bands.tiles_x[q]);
+    const int nx = p.nx;
+    const int ny = p.ny;
+    const int sx = nx + 2;
+    const int sy = ny + 2;
+    const int ps = m.ps;
+    const int lane = (int)threadIdx.x % TX;
+    const int ty = (int)threadIdx.x / TX;
+    const float inv_dx = p.inv_dx;
+    const float inv_dy = p.inv_dy;
+    const int gi = i0 + lane;
+    // Points outside the domain are never used by the general rows.
+    for (int lj = ty; lj < SH; lj += TY) {
+        const int gj = j0 - 5 + lj;
+        for (int li = lane; li < SW; li += TX) {
+            const int gs = i0 - 5 + li;
+            s[lj][li] = gs >= 0 && gs < sx && gj >= 0 && gj < sy ? m.in[gs + ps * gj] : 0.0f;
+        }
+    }
+    __syncthreads();
+    {
+        const int lj = ty;
+        const int gj = j0 + lj;
+        for (int lf = lane; lf < FXW; lf += TX) {
+            const int f = i0 - 4 + lf;
+            if (f >= 0 && f <= nx && gj <= ny) {
+                const fa_sline_t line = {&s[lj + 5][0], i0 - 5, 1};
+                fxd[lj][lf] = 0.5f * fa_t_grad(line, sx, f, inv_dx);
+                fxa[lj][lf] = m.vx[f + m.pf * gj] * fa_t_interp(line, sx, f);
+            }
+        }
+    }
+    for (int lg = ty; lg < FYH; lg += TY) {
+        const int g = j0 - 4 + lg;
+        if (g >= 0 && g <= ny && gi <= nx) {
+            const fa_sline_t line = {&s[0][lane + 5], j0 - 5, SW};
+            fyd[lg][lane] = 0.5f * fa_t_grad(line, sy, g, inv_dy);
+            fya[lg][lane] = m.vy[gi + ps * g] * fa_t_interp(line, sy, g);
+        }
+    }
+    __syncthreads();
+    const int gj = j0 + ty;
+    if (gi >= bands.c_hi[q] || gj >= bands.r_hi[q]) {
+        return;
+    }
+    const fa_sline_t xd = {&fxd[ty][0], i0 - 4, 1};
+    const fa_sline_t xa = {&fxa[ty][0], i0 - 4, 1};
+    const fa_sline_t yd = {&fyd[0][lane], j0 - 4, TX};
+    const fa_sline_t ya = {&fya[0][lane], j0 - 4, TX};
+    const float diffx = fa_t_div(xd, nx + 1, gi - 1, inv_dx);
+    const float diffy = fa_t_div(yd, ny + 1, gj - 1, inv_dy);
+    const float advx = fa_t_div(xa, nx + 1, gi - 1, inv_dx);
+    const float advy = fa_t_div(ya, ny + 1, gj - 1, inv_dy);
+    const float rhs = (diffx + diffy) - (advx + advy);
+    const int idx = gi + ps * gj;
+    float o, na;
+    fa_lean_update<STAGE>(rhs, m.base[idx], STAGE > 1 ? m.acc[idx] : 0.0f, p, o, na);
+    m.out[idx] = o;
+    if (STAGE < 4) {
+        m.acc[idx] = na;
+    }
+}
+
+// All boundary tiles of a stage in one grid of 192-thread blocks: 64 x 3
+// tiles for the top and bottom bands, 4 x 48 tiles for the side bands.  The
+// grid allows the interior kernel that follows it in the stream to launch
+// as soon as all its blocks have started (programmatic dependent launch), so
+// the short boundary blocks are scheduled first and the two grids overlap.
+template <int S>
+__global__ void __launch_bounds__(192)
+fa_lean_frame(fa_lptr_t m, fa_step_params_t p, fa_lean_bands_t bands, fa_lean_bands_t sides)
+{
+    asm volatile("griddepcontrol.launch_dependents;");
+    const int nb = bands.first[bands.n];
+    if ((int)blockIdx.x < nb) {
+        fa_lean_tile<S, 64, 3>(m, p, bands, (int)blockIdx.x);
+    } else {
+        fa_lean_tile<S, 4, 48>(m, p, sides, (int)blockIdx.x - nb);
+    }
+}
+
+template <int NW, int S>
+static void fa_launch_lean_stage(const fa_config_t *cfg, const fa_lptr_t &m, int H,
+    cudaStream_t s)
+{
+    constexpr int W = 64 * NW - 6;
+    const int nx = (int)cfg->nx;
+    const int ny = (int)cfg->ny;
+    const fa_step_params_t p = fa_step_params(cfg);
+    const fa_lean_bands_t bands = fa_lean_bands(nx, ny, false, 64, 3);
+    const fa_lean_bands_t sides = fa_lean_bands(nx, ny, true, 4, 48);
+    fa_lean_geo_t g;
+    const bool interior = fa_lean_geo(nx, ny, &g);
+    fa_lean_frame<S><<<bands.first[bands.n] + sides.first[sides.n], 192, 0, s>>>(m, p, bands,
+        sides);
+    if (interior) {
+        // The interior grid waits for the boundary grid only at its end
+        // (griddepcontrol.wait), so that the next stage, ordered after it,
+        // sees both.
+        cudaLaunchConfig_t lc = {};
+        lc.gridDim = dim3((g.col_hi - g.col_lo + W - 1) / W, (g.row_hi - g.row_lo + H - 1) / H,
+            1);
+        lc.blockDim = dim3(32 * NW, 1, 1);
+        lc.dynamicSmemBytes = 0;
+        lc.stream = s;
+        cudaLaunchAttribute attr[1];
+        attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr[0].val.programmaticStreamSerializationAllowed = 1;
+        lc.attrs = attr;
+        lc.numAttrs = 1;
+        fa_cuda_check(cudaLaunchKernelEx(&lc, fa_lean_stage<NW, S>, m, p, g, H),
+            "lean launch");
+    }
+}
+
+template <int NW>
+static void fa_launch_lean(const fa_config_t *cfg, fa_device_t *d, int parity, int H,
+    cudaStream_t s)
+{
+    fa_lptr_t m;
+    m.vx = d->m.vx;
+    m.vy = d->m.vy;
+    m.ps = d->m.ps;
+    m.pf = d->m.pf;
+    m.acc = d->m.acc;
+    float *base = d->m.base[parity];
+    m.base = base;
+    m.in = base;
+    m.out = d->m.stage[0];
+    fa_launch_lean_stage<NW, 1>(cfg, m, H, s);
+    m.in = d->m.stage[0];
+    m.out = d->m.stage[1];
+    fa_launch_lean_stage<NW, 2>(cfg, m, H, s);
+    m.in = d->m.stage[1];
+    m.out = d->m.stage[0];
+    fa_launch_lean_stage<NW, 3>(cfg, m, H, s);
+    m.in = d->m.stage[0];
+    m.out = d->m.base[parity ^ 1];
+    fa_launch_lean_stage<NW, 4>(cfg, m, H, s);
+}
+
 // Launch one timestep.  Only the "pair" variant alternates base buffers by
 // parity; the others always update d->base in place.
 static void fa_launch_step(const fa_options_t *opt, fa_device_t *d, int parity,
@@ -2896,6 +3338,14 @@ static void fa_launch_step(const fa_options_t *opt, fa_device_t *d, int parity,
         default: fa_die("unsupported march --block (64, 96 or 128)");
         }
         break;
+    case FA_KERNEL_LEAN:
+        switch (opt->block_x) {
+        case 64: fa_launch_lean<2>(cfg, d, parity, (int)opt->tile_y, s); break;
+        case 96: fa_launch_lean<3>(cfg, d, parity, (int)opt->tile_y, s); break;
+        case 128: fa_launch_lean<4>(cfg, d, parity, (int)opt->tile_y, s); break;
+        default: fa_die("unsupported lean --block (64, 96 or 128)");
+        }
+        break;
     default:
         fa_die("unsupported kernel variant");
     }
@@ -2906,11 +3356,16 @@ static void fa_upload_state(const fa_config_t *cfg, const fa_fields_t *fields,
 {
     const size_t sb = fields->scalar_len * sizeof(float);
     if (d->m.alloc[0]) {
+        // Both base buffers and the stage buffers start as base: fixed
+        // boundary points are never written.
         const size_t row = ((size_t)cfg->nx + 2) * sizeof(float);
-        for (int k = 0; k < 2; ++k) {
-            fa_cuda_check(cudaMemcpy2D(d->m.base[k], (size_t)d->m.ps * sizeof(float),
-                fields->base, row, row, (size_t)cfg->ny + 2, cudaMemcpyHostToDevice),
-                "upload padded base");
+        float *dst[4] = {d->m.base[0], d->m.base[1], d->m.stage[0], d->m.stage[1]};
+        for (int k = 0; k < 4; ++k) {
+            if (dst[k]) {
+                fa_cuda_check(cudaMemcpy2D(dst[k], (size_t)d->m.ps * sizeof(float),
+                    fields->base, row, row, (size_t)cfg->ny + 2, cudaMemcpyHostToDevice),
+                    "upload padded base");
+            }
         }
     }
     fa_cuda_check(cudaMemcpy(d->base, fields->base, sb, cudaMemcpyHostToDevice), "upload base");
@@ -2925,7 +3380,7 @@ static void fa_upload_state(const fa_config_t *cfg, const fa_fields_t *fields,
 
 // Resolve --kernel auto and fill in the tuned launch geometry of each
 // variant where --block/--tile-x/--tile-y were not given.  "auto" selects
-// "regyf" while the six full-size fields of the per-stage scheme (base, two
+// "lean" while the six full-size fields of the per-stage scheme (base, two
 // stage buffers, accumulator, both velocities) fit in the L2 cache, and
 // "march" (one fused kernel per timestep, about a fifth of the global traffic
 // of "pair") once they do not.
@@ -2934,7 +3389,7 @@ static void fa_resolve_kernel(fa_options_t *opt, size_t scalar_bytes)
     if (opt->kernel == FA_KERNEL_AUTO) {
         int l2 = 0;
         fa_cuda_check(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, 0), "L2 size");
-        opt->kernel = 6 * scalar_bytes <= (size_t)l2 ? FA_KERNEL_REGYF : FA_KERNEL_MARCH;
+        opt->kernel = 6 * scalar_bytes <= (size_t)l2 ? FA_KERNEL_LEAN : FA_KERNEL_MARCH;
     }
     uint32_t bx = 32, by = 8, tx = 32, ty = 16;
     switch (opt->kernel) {
@@ -2943,6 +3398,13 @@ static void fa_resolve_kernel(fa_options_t *opt, size_t scalar_bytes)
     case FA_KERNEL_REGYF: ty = 24; break;
     case FA_KERNEL_PAIR: by = 6; tx = 58; ty = 12; break;
     case FA_KERNEL_MARCH: bx = 128; by = 1; tx = 230; ty = 64; break;
+    case FA_KERNEL_LEAN:
+        // Tuned at 2048^2 (96 threads, 32 rows) and 1024^2 (64, 24).
+        bx = (uint64_t)opt->cfg.nx * opt->cfg.ny >= 2000000 ? 96 : 64;
+        by = 1;
+        tx = 2 * bx - 6;
+        ty = bx == 96 ? 32 : 24;
+        break;
     default: break;
     }
     if (!opt->block_supplied) {
@@ -2973,6 +3435,16 @@ static void fa_resolve_kernel(fa_options_t *opt, size_t scalar_bytes)
             opt->tile_x = 32;
             opt->tile_y = 24;
         }
+    }
+    if (opt->kernel == FA_KERNEL_LEAN) {
+        if (opt->block_x != 64 && opt->block_x != 96 && opt->block_x != 128) {
+            fa_die("lean supports --block 64, 96 or 128");
+        }
+        if (opt->tile_y % FA_M_R != 0 || opt->tile_y < 8) {
+            fa_die("lean requires --tile-y a multiple of 8");
+        }
+        opt->block_y = 1;
+        opt->tile_x = 2 * opt->block_x - 6;
     }
     if ((uint64_t)opt->block_x * opt->block_y > 1024) {
         fa_die("block exceeds 1024 threads");
@@ -3012,25 +3484,31 @@ static void fa_run_cuda(const fa_options_t *opt, fa_fields_t *fields,
     }
     fa_cuda_check(cudaMemcpy(d.vx, fields->vx, xb, cudaMemcpyHostToDevice), "upload vx");
     fa_cuda_check(cudaMemcpy(d.vy, fields->vy, yb, cudaMemcpyHostToDevice), "upload vy");
-    if (opt->kernel == FA_KERNEL_MARCH) {
+    if (opt->kernel == FA_KERNEL_MARCH || opt->kernel == FA_KERNEL_LEAN) {
         const size_t nx = opt->cfg.nx;
         const size_t ny = opt->cfg.ny;
         const size_t pad = FA_M_PAD;
         d.m.ps = (int)((nx + 2 + 2 * pad + 31) / 32 * 32);
         d.m.pf = (int)((nx + 1 + 2 * pad + 31) / 32 * 32);
         const size_t rows = ny + 2 + 2 * pad;
-        const size_t bytes[4] = {(size_t)d.m.ps * rows * sizeof(float),
-            (size_t)d.m.ps * rows * sizeof(float), (size_t)d.m.pf * rows * sizeof(float),
-            (size_t)d.m.ps * rows * sizeof(float)};
-        for (int k = 0; k < 4; ++k) {
-            fa_cuda_check(cudaMalloc((void **)&d.m.alloc[k], bytes[k]), "malloc padded");
-            fa_cuda_check(cudaMemset(d.m.alloc[k], 0, bytes[k]), "memset padded");
+        const size_t sbytes = (size_t)d.m.ps * rows * sizeof(float);
+        const size_t fbytes = (size_t)d.m.pf * rows * sizeof(float);
+        const int nalloc = opt->kernel == FA_KERNEL_LEAN ? 7 : 4;
+        for (int k = 0; k < nalloc; ++k) {
+            const size_t bytes = k == 2 ? fbytes : sbytes;
+            fa_cuda_check(cudaMalloc((void **)&d.m.alloc[k], bytes), "malloc padded");
+            fa_cuda_check(cudaMemset(d.m.alloc[k], 0, bytes), "memset padded");
         }
         const size_t origin = pad + (size_t)d.m.ps * pad;
         d.m.base[0] = d.m.alloc[0] + origin;
         d.m.base[1] = d.m.alloc[1] + origin;
         d.m.vx = d.m.alloc[2] + pad + (size_t)d.m.pf * pad;
         d.m.vy = d.m.alloc[3] + origin;
+        if (nalloc == 7) {
+            d.m.stage[0] = d.m.alloc[4] + origin;
+            d.m.stage[1] = d.m.alloc[5] + origin;
+            d.m.acc = d.m.alloc[6] + origin;
+        }
         fa_cuda_check(cudaMemcpy2D(d.m.vx, (size_t)d.m.pf * sizeof(float), fields->vx,
             (nx + 1) * sizeof(float), (nx + 1) * sizeof(float), ny + 2,
             cudaMemcpyHostToDevice), "upload padded vx");
@@ -3098,7 +3576,7 @@ static void fa_run_cuda(const fa_options_t *opt, fa_fields_t *fields,
     fa_cuda_check(cudaGetLastError(), "solve launch");
     fa_cuda_check(cudaEventRecord(ev_end, stream), "record end");
     const float *final_base = (d.base_alt && (opt->cfg.steps & 1u)) ? d.base_alt : d.base;
-    if (opt->kernel == FA_KERNEL_MARCH) {
+    if (opt->kernel == FA_KERNEL_MARCH || opt->kernel == FA_KERNEL_LEAN) {
         const size_t row = ((size_t)opt->cfg.nx + 2) * sizeof(float);
         fa_cuda_check(cudaMemcpy2DAsync(fields->base, row, d.m.base[opt->cfg.steps & 1u],
             (size_t)d.m.ps * sizeof(float), row, (size_t)opt->cfg.ny + 2,
@@ -3132,7 +3610,7 @@ static void fa_run_cuda(const fa_options_t *opt, fa_fields_t *fields,
     cudaEventDestroy(d.join);
     cudaFree(d.base);
     cudaFree(d.base_alt);
-    for (int k = 0; k < 4; ++k) {
+    for (int k = 0; k < 7; ++k) {
         cudaFree(d.m.alloc[k]);
     }
     cudaFree(d.stage[0]);
@@ -3155,7 +3633,7 @@ static void fa_usage(const char *argv0)
     fprintf(stderr,
         "usage: %s [--mode cpu|cuda] [--cells nx,ny] [--steps n] [--dt dt]\n"
         "          [--input path] [--output path] [--dump [path]] [--dump-bin [path]]\n"
-        "          [--kernel auto|split|fused|tiled|prefetch|regy|regyf|pair|march] [--block x[,y]]\n"
+        "          [--kernel auto|split|fused|tiled|prefetch|regy|regyf|pair|march|lean] [--block x[,y]]\n"
         "          [--tile-x n] [--tile-y n] [--frame-parts n] [--graph on|off]\n",
         argv0);
 }
