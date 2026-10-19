@@ -91,15 +91,19 @@ steps, medians of 5 interleaved runs:
 | `regy` | 0.0591 | 0.1390 | 1.1658 | y direction register-blocked: a thread owns 3 consecutive cells of a column and computes their 6 y faces in registers; x faces via shared memory over a flat work list |
 | `regyf` | 0.0387 | 0.1101 | 1.1497 | boundary tiles in a separate, concurrent frame kernel, split into 32 x 8 blocks; the interior kernel drops all general code (66 → 40 registers) |
 | `pair` | 0.0569 | 0.1610 | 0.6499 | two RK stages per kernel with halo recomputation; stage-1/3 fields never leave the chip; half the DRAM traffic per step |
-| `march` | 0.0886 | 0.1155 | **0.3283** | one kernel per timestep (all four stages): blocks march down column strips with a register pipeline in y; only base and the velocities are read and base written per step |
+| `march` | 0.0914 | 0.1154 | **0.2969** | one kernel per timestep (all four stages): blocks march down column strips with a register pipeline in y; only base and the velocities are read and base written per step |
 | `lean` | 0.0377 | 0.0833 | 1.1788 | one kernel per stage with the `march` layout on padded fields: every field read once, the stage input with a 3-row halo; boundary rim in a separate grid overlapped by programmatic dependent launch |
-| `lean2` | **0.0273** | **0.0555** | 0.5840 | `lean` with two stages per kernel (1+2, 3+4): about 11 instead of 26 field accesses per step |
-| `auto` (default) | 0.0273 | 0.0556 | 0.3289 | `lean2` if 6 fields fit in L2, else `march` |
+| `lean2` | **0.0274** | **0.0558** | 0.5851 | `lean` with two stages per kernel (1+2, 3+4): about 11 instead of 26 field accesses per step |
+| `auto` (default) | 0.0274 | 0.0557 | 0.2971 | `lean2` if 6 fields fit in L2, else `march` |
 
 Speed-up of the default over LFortran Formal: **10.2x at 2048²** and 3.4x at
 1024².  Against the best variant before `march`/`lean`/`lean2` (`regyf` at
-1024² and 2048², `pair` at 4096², same final source): 1.42x, 1.98x and
-1.98x.  CUDA Graphs: the timestep loop has no host synchronization in any
+1024² and 2048², `pair` at 4096², same final source): 1.41x, 1.98x and
+2.19x.  Against the compulsory-traffic roof (16 N² bytes per step at the
+L2-resident copy rate of 5.5 TB/s for 1024² and 2048², at the 1.598 TB/s
+DRAM peak for 4096²): 11%, 22% and **57%** (see the roofline table).
+(The `march` and `lean2` rows were re-measured after the last `march`
+change; the other rows come from the run before it.)  CUDA Graphs: the timestep loop has no host synchronization in any
 mode, but each graph launch costs about a microsecond of GPU time; one
 graph per timestep was even slower than direct launches for `lean2`
 (0.0574 vs 0.0565 s).  Graphs of 10 timesteps (`--graph-steps`, default)
@@ -279,21 +283,56 @@ instructions over the warp-issue peak.
 | 2048 | `regyf` | 0.1101 | 52 | 0.472 | 29.6% | 623 | 5.66 | 103% | 100.0% | 1.420 | 12.90 | 11.0% | 57% | 0.611 | 11.1% |
 | 2048 | `march` | 0.1155 | 5 | 0.043 | 2.7% | 309 | 2.68 | 49% | 100.0% | 1.609 | 13.93 | 11.9% | 24% | 0.582 | 10.6% |
 | 2048 | `lean` | 0.0833 | 67 | 0.804 | 50.3% | 510 | 6.12 | 111% | 98.1% | 1.109 | 13.31 | 11.4% | 29% | 0.807 | 14.7% |
-| 2048 | **`lean2` (default)** | 0.0555 | 32 | 0.577 | 36.1% | 266 | 4.79 | 87% | 99.8% | 1.269 | 22.86 | 19.6% | 45% | 1.212 | 22.0% |
+| 2048 | **`lean2` (default)** | 0.0557 | 32 | 0.575 | 36.0% | 266 | 4.78 | 87% | 99.8% | 1.269 | 22.78 | 19.5% | 45% | 1.207 | 21.9% |
 | 1024 | LFortran Formal (initial) | 0.093 | 1 | 0.011 | 0.7% | 425 | 4.57 | 83% | 100.0% | 0.304 | 3.27 | 2.8% |  | 0.181 | 3.3% |
 | 1024 | `regyf` | 0.0387 | 0 | 0.000 | 0.0% | 158 | 4.08 | 74% | 99.9% | 0.361 | 9.33 | 8.0% | 46% | 0.435 | 7.9% |
-| 1024 | **`lean2` (default)** | 0.0273 | 0 | 0.000 | 0.0% | 79 | 2.89 | 53% | 99.9% | 0.353 | 12.93 | 11.1% | 30% | 0.617 | 11.2% |
+| 1024 | **`lean2` (default)** | 0.0274 | 0 | 0.000 | 0.0% | 79 | 2.88 | 52% | 99.9% | 0.353 | 12.88 | 11.0% | 30% | 0.615 | 11.2% |
 | 4096 | `split` (initial) | 3.045 | 4015 | 1.319 | 82.5% | 5725 | 1.88 | 34% | 43.5% | 6.059 | 1.99 | 1.7% |  | 0.088 | 5.5% |
 | 4096 | `regyf` (initial) | 1.16 | 1685 | 1.453 | 90.9% | 2485 | 2.14 | 39% | 42.2% | 5.620 | 4.84 | 4.1% |  | 0.232 | 14.5% |
 | 4096 | `pair` | 0.6499 | 747 | 1.149 | 71.9% | 1992 | 3.07 | 56% | 60.2% | 7.694 | 11.84 | 10.1% | 45% | 0.413 | 25.9% |
-| 4096 | `lean2` | 0.584 | 819 | 1.402 | 87.8% | 1042 | 1.78 | 32% | 45.8% | 5.016 | 8.59 | 7.3% | 15% | 0.460 | 28.8% |
-| 4096 | **`march` (default)** | 0.3283 | 279 | 0.850 | 53.2% | 1218 | 3.71 | 67% | 80.8% | 6.226 | 18.96 | 16.2% | 31% | 0.818 | 51.2% |
+| 4096 | `lean2` | 0.5851 | 819 | 1.400 | 87.6% | 1042 | 1.78 | 32% | 45.8% | 5.016 | 8.57 | 7.3% | 15% | 0.459 | 28.7% |
+| 4096 | **`march` (default)** | 0.2969 | 293 | 0.987 | 61.8% | 866 | 2.92 | 53% | 76.2% | 5.532 | 18.63 | 15.9% | 30% | 0.905 | 56.6% |
 
 Rows marked "initial" were profiled with the source of commit `96cd521`
 (pageable final copy); their ms/step are from that measurement.  Relative to
 the 1.792 TB/s specification the DRAM percentages are 0.89x these.  Nsight
 Compute FLOP counts include the interior-formula faces of halos and are
 counted per executed instruction (FFMA = 2).
+
+Further experiments that did not pay off (final source unchanged):
+
+- `lean2` with dataflow ordering instead of kernel boundaries: all four
+  grids of a step launched programmatically and overlapping, each block
+  waiting on completion counters of the 3 x 3 neighbouring blocks of the
+  previous phase (invocation numbers from tickets, coherent loads).  A probe
+  that simply let consecutive pair grids overlap (wrong, no waits) ran
+  2048² in 0.038 s, so the kernel boundaries cost about a quarter of the
+  time, but the correct version was slower: 0.0656 s (2048²), 0.0374 s
+  (1024²); 0.0599 s with non-coherent loads (168 registers) - the waiting
+  blocks hold the SM slots.  Its first version also showed why the
+  invocation number cannot come from a per-block counter: a block of the
+  next invocation can start before the same block of the previous one has
+  finished.
+- `lean2` loading the pair-1 accumulator rows with the other chunk loads
+  (195 registers, 0.0557 → 0.0664 s).
+- `lean2` rim tiles of other shapes at 1024² (16 x 6 / 8 x 16 0.0289 s,
+  32 x 6 / 8 x 16 0.0276 s, 64 x 6 / 8 x 64 0.0383 s vs 0.0274 s); without
+  the rim grid (wrong boundaries, serialized grids) 1024² would take
+  0.0208 s and 2048² 0.0507 s, so the rim costs 25% and 9%.
+- `lean2` with one-warp blocks (32 threads, 52 columns): 1024² 0.0273 s
+  at 32 rows, no gain; 2048² 0.0613 s.
+- `march` carrying the velocities and base across the stage-2/3 boundary
+  as well (64-byte spill, 0.300 vs 0.297 s).
+
+Why 2048² stays at 22% of the L2 roof: the `lean2` strip kernel issues 46 M
+warp instructions per step (about 1.2x the FP32 operations the method needs
+per cell and stage plus halo work), i.e. 25 µs at the full warp-issue
+rate, and at 64 x 64 blocks the grid holds only ~6 resident warps per SM
+(5.9 measured; more parallelism through shorter segments costs more halo
+than it gains), so it issues on 43% of the cycles; its L2 traffic (266 MB)
+already runs at 4.6 TB/s.  Reaching 50% of the compulsory roof would need
+both all four stages on chip (the register budget of `march` shows the
+cost) and near-full issue.
 
 Which roof applies:
 

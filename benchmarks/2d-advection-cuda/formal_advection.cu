@@ -4053,7 +4053,13 @@ static void fa_resolve_kernel(fa_options_t *opt, size_t scalar_bytes)
     case FA_KERNEL_REGY:
     case FA_KERNEL_REGYF: ty = 24; break;
     case FA_KERNEL_PAIR: by = 6; tx = 58; ty = 12; break;
-    case FA_KERNEL_MARCH: bx = 128; by = 1; tx = 230; ty = 128; break;
+    case FA_KERNEL_MARCH:
+        // 128-row segments from 8 M cells on (4096^2), 64 below.
+        bx = 128;
+        by = 1;
+        tx = 230;
+        ty = (uint64_t)opt->cfg.nx * opt->cfg.ny >= 8000000 ? 128 : 64;
+        break;
     case FA_KERNEL_LEAN:
         // Tuned at 2048^2 (96 threads, 32 rows) and 1024^2 (64, 24).
         bx = (uint64_t)opt->cfg.nx * opt->cfg.ny >= 2000000 ? 96 : 64;
