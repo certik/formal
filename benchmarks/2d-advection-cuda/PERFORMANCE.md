@@ -79,10 +79,10 @@ validated (see [Validation](#validation)).  Solve-wall medians of 5 runs:
 | `tiled` | 0.0597 | 0.1683 | 1.5083 | warp-shaped 32-wide tiles, 32-bit indexing, branch-free interior operator rows for tiles away from boundaries |
 | `prefetch` | 0.0598 | 0.1538 | 1.1725 | all global loads of a tile (velocities, base, accumulator) issued to registers before the first barrier |
 | `regy` | 0.0615 | 0.1400 | 1.1799 | y direction register-blocked: a thread owns 3 consecutive cells of a column and computes their 6 y faces in registers; x faces via shared memory over a flat work list |
-| `regyf` | 0.0544 | **0.1164** | 1.1603 | boundary tiles moved to a separate, concurrent frame kernel; the interior kernel drops all general code (66 → 40 registers) |
+| `regyf` | 0.0430 | **0.1164** | 1.1603 | boundary tiles moved to a separate, concurrent frame kernel; the interior kernel drops all general code (66 → 40 registers); frame tiles split into 32 x 8 blocks (1024²: 0.0546 → 0.0430) |
 | `pair` | 0.0774 | 0.1786 | 0.6745 | two RK stages per kernel with halo recomputation; stage-1/3 fields never leave the chip; half the DRAM traffic per step |
 | `march` | 0.0977 | 0.1237 | **0.3590** | one kernel per timestep (all four stages): blocks march down column strips with a register pipeline in y; only base and the velocities are read and base written per step (see below) |
-| `auto` (default) | 0.0545 | 0.1180 | 0.3590 | `regyf` if 6 fields fit in L2, else `march` |
+| `auto` (default) | 0.0430 | 0.1180 | 0.3590 | `regyf` if 6 fields fit in L2, else `march` |
 
 Speed-up of the default over LFortran Formal: **4.8x at 2048²** and 1.7x at
 1024².  CUDA Graphs (one graph per timestep) made no measurable difference
@@ -139,6 +139,13 @@ GPU without very short segments, whose 12-row warm-up dominates.  Sweeps
 (2048², s): block 128 / tile-y 48 / 3 parts 0.119, 96/4 parts 0.119,
 32/2 0.122, 64/2 0.124; block 64 0.128-0.153; 4096² (200 steps): 128/64/2
 0.0744, 128/48/1 0.0839, 64/128/2 0.0869.
+
+`regyf` frame split: the general (boundary) path has about twice the
+latency of the interior one.  At 1024² the interior kernel of a stage takes
+only ~8 µs, and the frame kernel (146 tiles of 32 x 24, ~11 µs) was the
+critical path of every stage.  Splitting each frame tile into three blocks
+of 32 x 8 cells (`fa_regy_frame`) takes it off the critical path: 1024²
+0.0546 → 0.0430 s (interleaved, 5 runs each), 2048² unchanged.
 
 Rejected experiments (in commit `d353184`): a shared-memory-free "stream"
 kernel (warps walking 26-column strips with shuffles in x and a register

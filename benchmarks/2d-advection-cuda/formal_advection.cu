@@ -1696,6 +1696,31 @@ fa_regy_stage(const float *__restrict__ stage_in, float *base, float *stage_out,
     }
 }
 
+// Frame tiles of "regyf" split into TY / 8 parts of 32 x 8 cells, one
+// block of 32 x 8 threads each: the general path has about twice the
+// latency of the interior one, and shorter blocks keep it off the critical
+// path when the interior kernel is short (small grids).
+template <int TY, int STAGE>
+__global__ void __launch_bounds__(256)
+fa_regy_frame(const float *__restrict__ stage_in, float *base, float *stage_out,
+    float *accum, const float *__restrict__ vx, const float *__restrict__ vy,
+    fa_stage_params_t p, fa_tiles_t tiles)
+{
+    constexpr int TYF = 8;
+    constexpr int PARTS = TY / TYF;
+    static_assert(TY % TYF == 0, "frame parts need TY = 8k");
+    __shared__ float s[TYF + 8][40];
+    __shared__ float fxd[TYF][37];
+    __shared__ float fxa[TYF][37];
+    __shared__ float fyd[TYF + 5][32];
+    __shared__ float fya[TYF + 5][32];
+    int bx, by;
+    fa_frame_tile(tiles, (int)blockIdx.x / PARTS, bx, by);
+    const int part = (int)blockIdx.x % PARTS;
+    fa_tile_general<TYF, 8, STAGE>(stage_in, base, stage_out, accum, vx, vy, p,
+        1 + bx * 32, 1 + by * TY + part * TYF, s, fxd, fxa, fyd, fya);
+}
+
 template <int TY, int BY, int STAGE>
 static void fa_launch_regy_stage(const fa_config_t *cfg, fa_device_t *d, bool split,
     const float *in, float *out, cudaStream_t s)
@@ -1717,8 +1742,13 @@ static void fa_launch_regy_stage(const fa_config_t *cfg, fa_device_t *d, bool sp
     fa_cuda_check(cudaEventRecord(d->fork, s), "fork record");
     fa_cuda_check(cudaStreamWaitEvent(d->side, d->fork, 0), "fork wait");
     if (frame > 0) {
-        fa_regy_stage<TY, BY, STAGE, 2><<<frame, block, 0, d->side>>>(in, d->base, out,
-            d->accum, d->vx, d->vy, p, t);
+        if (TY % 8 == 0) {
+            fa_regy_frame<TY % 8 == 0 ? TY : 8, STAGE><<<frame * (TY / 8), dim3(32, 8, 1), 0,
+                d->side>>>(in, d->base, out, d->accum, d->vx, d->vy, p, t);
+        } else {
+            fa_regy_stage<TY, BY, STAGE, 2><<<frame, block, 0, d->side>>>(in, d->base, out,
+                d->accum, d->vx, d->vy, p, t);
+        }
     }
     if (interior > 0) {
         const dim3 grid(t.bx_hi - t.bx_lo + 1, t.by_hi - t.by_lo + 1, 1);
