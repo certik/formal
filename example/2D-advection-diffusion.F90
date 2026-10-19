@@ -36,6 +36,7 @@ program advection_diffusion_2D
   use formal_advection_workspace, only : &
      fa_advance_rk4 &
     ,fa_advance_rk4_fused &
+    ,fa_advance_rk4_fused2 &
     ,fa_fields_t &
     ,fa_init_from_arrays &
     ,fa_read_raw_input &
@@ -67,7 +68,7 @@ program advection_diffusion_2D
     logical :: dt_supplied = .false.
     logical :: cells_supplied = .false.
     logical :: steps_supplied = .false.
-    logical :: fused = .false.
+    integer :: workspace_kernel = 0
     character(len=:), allocatable :: input_path
     character(len=:), allocatable :: dump_final_raw_path
   end type
@@ -97,7 +98,7 @@ program advection_diffusion_2D
       // '    --example 2D-advection-diffusion \' // new_line('') &
       // '    --compiler flang \' // new_line('') &
       // '    --flag "-O3" \' // new_line('') &
-      // '    -- [--solver workspace|operators] [--cells <n[,m]>] [--steps <integer>] [--dt <real>] [--order <integer>] [--benchmark] [--no-csv] [--dump-input <path>] [--dump-final-raw <path>] [--input <path>] [--workspace-kernel split|fused] [--gpu-profile]' // new_line('') &
+      // '    -- [--solver workspace|operators] [--cells <n[,m]>] [--steps <integer>] [--dt <real>] [--order <integer>] [--benchmark] [--no-csv] [--dump-input <path>] [--dump-final-raw <path>] [--input <path>] [--workspace-kernel split|fused|fused2] [--gpu-profile]' // new_line('') &
       // '  or use the no-argument legacy regression case (51x51, 500 steps, dt = 1e-4).' // new_line('') // new_line('') &
       // 'When --dt is omitted, the default time step scales as 1e-4 * min(51/Nx, 51/Ny)^2.' // new_line('') // new_line('') &
       // 'Use --benchmark for the 257x257, 30000-step preset; explicit --cells, --steps, and --dt override the preset.' // new_line('') // new_line('') &
@@ -172,11 +173,14 @@ program advection_diffusion_2D
     if (.not. warmup_gpu_stats%gpu_timing_available) error stop "gpu profiling requested but unavailable"
   end if
   if (args%solver == solver_workspace) then
-    if (args%fused) then
+    select case (args%workspace_kernel)
+    case (1)
       call fa_advance_rk4_fused(workspace_fields, args%cells(1), args%cells(2), 1, args%dt, pi, 0.5E0)
-    else
+    case (2)
+      call fa_advance_rk4_fused2(workspace_fields, args%cells(1), args%cells(2), 1, args%dt, pi, 0.5E0)
+    case default
       call fa_advance_rk4(workspace_fields, args%cells(1), args%cells(2), 1, args%dt, pi, 0.5E0)
-    end if
+    end select
   else
     warmup_rhs = s
     call advance_one_step(warmup_rhs, v, args%dt)
@@ -199,11 +203,14 @@ program advection_diffusion_2D
       if (.not. solve_gpu_stats%gpu_timing_available) error stop "gpu profiling requested but unavailable"
     end if
     call system_clock(count=solve_start)
-    if (args%fused) then
+    select case (args%workspace_kernel)
+    case (1)
       call fa_advance_rk4_fused(workspace_fields, args%cells(1), args%cells(2), args%steps, args%dt, pi, 0.5E0)
-    else
+    case (2)
+      call fa_advance_rk4_fused2(workspace_fields, args%cells(1), args%cells(2), args%steps, args%dt, pi, 0.5E0)
+    case default
       call fa_advance_rk4(workspace_fields, args%cells(1), args%cells(2), args%steps, args%dt, pi, 0.5E0)
-    end if
+    end select
     if (gpu_profile_requested) call gpu_benchmark_end(solve_gpu_stats)
     call system_clock(count=solve_end)
   else
@@ -373,11 +380,13 @@ contains
     if (len(kernel_string) /= 0) then
       select case (trim(adjustl(kernel_string)))
       case ("split")
-        numerical_arguments%fused = .false.
+        numerical_arguments%workspace_kernel = 0
       case ("fused")
-        numerical_arguments%fused = .true.
+        numerical_arguments%workspace_kernel = 1
+      case ("fused2")
+        numerical_arguments%workspace_kernel = 2
       case default
-        error stop "--workspace-kernel must be split or fused"
+        error stop "--workspace-kernel must be split, fused or fused2"
       end select
     end if
 

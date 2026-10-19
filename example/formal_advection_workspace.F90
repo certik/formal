@@ -4,7 +4,8 @@ module formal_advection_workspace
     implicit none
     private
     public :: fa_config_t, fa_options_t, fa_fields_t, fa_parse_args
-    public :: fa_init_fields, fa_advance_rk4, fa_advance_rk4_fused, fa_write_csv, fa_reconstruct_scalar
+    public :: fa_init_fields, fa_advance_rk4, fa_advance_rk4_fused, fa_advance_rk4_fused2
+    public :: fa_write_csv, fa_reconstruct_scalar
     public :: fa_init_from_arrays, fa_write_final_raw
     public :: fa_validate_cfg, fa_validate_working_set, fa_read_raw_input
     public :: fa_now_seconds
@@ -764,6 +765,318 @@ contains
         end do
         deallocate(base, q, q2, acc, vx, vy)
     end subroutine fa_advance_rk4_fused
+
+    ! The diffusive and advective flux at x face k from one set of
+    ! loads: the rows of fa_grad_face_x and fa_interp_face_x, in
+    ! their order.
+    pure subroutine fa_face_fluxes_x(q, v, nx, ny, k, j, inv_dx, diffusion, fd, fa)
+        real(real32), intent(in) :: q(:,:), v(:,:)
+        integer, intent(in) :: nx, ny, k, j
+        real(real32), intent(in) :: inv_dx, diffusion
+        real(real32), intent(out) :: fd, fa
+        real(real32) :: g, c
+        integer :: n
+        n = nx + 2
+        if (k == 1) then
+            g = inv_dx * ((-352.0_real32 / 105.0_real32) * q(1, j) &
+                + (35.0_real32 / 8.0_real32) * q(2, j) &
+                + (-35.0_real32 / 24.0_real32) * q(3, j) &
+                + (21.0_real32 / 40.0_real32) * q(4, j) &
+                + (-5.0_real32 / 56.0_real32) * q(5, j))
+            c = q(1, j)
+        else if (k == 2) then
+            g = inv_dx * ((16.0_real32 / 105.0_real32) * q(1, j) &
+                + (-31.0_real32 / 24.0_real32) * q(2, j) &
+                + (29.0_real32 / 24.0_real32) * q(3, j) &
+                + (-3.0_real32 / 40.0_real32) * q(4, j) &
+                + (1.0_real32 / 168.0_real32) * q(5, j))
+            c = (-16.0_real32 / 112.0_real32) * q(1, j) &
+                + (70.0_real32 / 112.0_real32) * q(2, j) &
+                + (70.0_real32 / 112.0_real32) * q(3, j) &
+                + (-14.0_real32 / 112.0_real32) * q(4, j) &
+                + (2.0_real32 / 112.0_real32) * q(5, j)
+        else if (k + 2 < n) then
+            g = inv_dx * ((1.0_real32 / 24.0_real32) * q(k - 1, j) &
+                + (-9.0_real32 / 8.0_real32) * q(k, j) &
+                + (9.0_real32 / 8.0_real32) * q(k + 1, j) &
+                + (-1.0_real32 / 24.0_real32) * q(k + 2, j))
+            c = (-7.0_real32 / 112.0_real32) * q(k - 1, j) &
+                + (63.0_real32 / 112.0_real32) * q(k, j) &
+                + (63.0_real32 / 112.0_real32) * q(k + 1, j) &
+                + (-7.0_real32 / 112.0_real32) * q(k + 2, j)
+        else if (k == n - 2) then
+            g = inv_dx * ((-1.0_real32 / 168.0_real32) * q(n - 4, j) &
+                + (3.0_real32 / 40.0_real32) * q(n - 3, j) &
+                + (-29.0_real32 / 24.0_real32) * q(n - 2, j) &
+                + (31.0_real32 / 24.0_real32) * q(n - 1, j) &
+                + (-16.0_real32 / 105.0_real32) * q(n, j))
+            c = (2.0_real32 / 112.0_real32) * q(n - 4, j) &
+                + (-14.0_real32 / 112.0_real32) * q(n - 3, j) &
+                + (70.0_real32 / 112.0_real32) * q(n - 2, j) &
+                + (70.0_real32 / 112.0_real32) * q(n - 1, j) &
+                + (-16.0_real32 / 112.0_real32) * q(n, j)
+        else
+            g = inv_dx * ((5.0_real32 / 56.0_real32) * q(n - 4, j) &
+                + (-21.0_real32 / 40.0_real32) * q(n - 3, j) &
+                + (35.0_real32 / 24.0_real32) * q(n - 2, j) &
+                + (-35.0_real32 / 8.0_real32) * q(n - 1, j) &
+                + (352.0_real32 / 105.0_real32) * q(n, j))
+            c = q(n, j)
+        end if
+        fd = diffusion * g
+        fa = v(k, j) * c
+    end subroutine fa_face_fluxes_x
+
+    ! The diffusive and advective flux at y face k from one set of
+    ! loads: the rows of fa_grad_face_y and fa_interp_face_y, in
+    ! their order.
+    pure subroutine fa_face_fluxes_y(q, v, nx, ny, i, k, inv_dy, diffusion, fd, fa)
+        real(real32), intent(in) :: q(:,:), v(:,:)
+        integer, intent(in) :: nx, ny, i, k
+        real(real32), intent(in) :: inv_dy, diffusion
+        real(real32), intent(out) :: fd, fa
+        real(real32) :: g, c
+        integer :: n
+        n = ny + 2
+        if (k == 1) then
+            g = inv_dy * ((-352.0_real32 / 105.0_real32) * q(i, 1) &
+                + (35.0_real32 / 8.0_real32) * q(i, 2) &
+                + (-35.0_real32 / 24.0_real32) * q(i, 3) &
+                + (21.0_real32 / 40.0_real32) * q(i, 4) &
+                + (-5.0_real32 / 56.0_real32) * q(i, 5))
+            c = q(i, 1)
+        else if (k == 2) then
+            g = inv_dy * ((16.0_real32 / 105.0_real32) * q(i, 1) &
+                + (-31.0_real32 / 24.0_real32) * q(i, 2) &
+                + (29.0_real32 / 24.0_real32) * q(i, 3) &
+                + (-3.0_real32 / 40.0_real32) * q(i, 4) &
+                + (1.0_real32 / 168.0_real32) * q(i, 5))
+            c = (-16.0_real32 / 112.0_real32) * q(i, 1) &
+                + (70.0_real32 / 112.0_real32) * q(i, 2) &
+                + (70.0_real32 / 112.0_real32) * q(i, 3) &
+                + (-14.0_real32 / 112.0_real32) * q(i, 4) &
+                + (2.0_real32 / 112.0_real32) * q(i, 5)
+        else if (k + 2 < n) then
+            g = inv_dy * ((1.0_real32 / 24.0_real32) * q(i, k - 1) &
+                + (-9.0_real32 / 8.0_real32) * q(i, k) &
+                + (9.0_real32 / 8.0_real32) * q(i, k + 1) &
+                + (-1.0_real32 / 24.0_real32) * q(i, k + 2))
+            c = (-7.0_real32 / 112.0_real32) * q(i, k - 1) &
+                + (63.0_real32 / 112.0_real32) * q(i, k) &
+                + (63.0_real32 / 112.0_real32) * q(i, k + 1) &
+                + (-7.0_real32 / 112.0_real32) * q(i, k + 2)
+        else if (k == n - 2) then
+            g = inv_dy * ((-1.0_real32 / 168.0_real32) * q(i, n - 4) &
+                + (3.0_real32 / 40.0_real32) * q(i, n - 3) &
+                + (-29.0_real32 / 24.0_real32) * q(i, n - 2) &
+                + (31.0_real32 / 24.0_real32) * q(i, n - 1) &
+                + (-16.0_real32 / 105.0_real32) * q(i, n))
+            c = (2.0_real32 / 112.0_real32) * q(i, n - 4) &
+                + (-14.0_real32 / 112.0_real32) * q(i, n - 3) &
+                + (70.0_real32 / 112.0_real32) * q(i, n - 2) &
+                + (70.0_real32 / 112.0_real32) * q(i, n - 1) &
+                + (-16.0_real32 / 112.0_real32) * q(i, n)
+        else
+            g = inv_dy * ((5.0_real32 / 56.0_real32) * q(i, n - 4) &
+                + (-21.0_real32 / 40.0_real32) * q(i, n - 3) &
+                + (35.0_real32 / 24.0_real32) * q(i, n - 2) &
+                + (-35.0_real32 / 8.0_real32) * q(i, n - 1) &
+                + (352.0_real32 / 105.0_real32) * q(i, n))
+            c = q(i, n)
+        end if
+        fd = diffusion * g
+        fa = v(i, k) * c
+    end subroutine fa_face_fluxes_y
+
+    ! fa_div_face_x of the diffusive (dd) and the advective (da) face
+    ! fluxes of q, each face computed once for both.
+    pure subroutine fa_fused2_div_x(q, v, nx, ny, i, j, inv_dx, diffusion, dd, da)
+        real(real32), intent(in) :: q(:,:), v(:,:)
+        integer, intent(in) :: nx, ny, i, j
+        real(real32), intent(in) :: inv_dx, diffusion
+        real(real32), intent(out) :: dd, da
+        real(real32) :: fd(5), fa(5)
+        integer :: n
+        n = nx + 1
+        if (i == 1) then
+            call fa_face_fluxes_x(q, v, nx, ny, 1, j, inv_dx, diffusion, fd(1), fa(1))
+            call fa_face_fluxes_x(q, v, nx, ny, 2, j, inv_dx, diffusion, fd(2), fa(2))
+            call fa_face_fluxes_x(q, v, nx, ny, 3, j, inv_dx, diffusion, fd(3), fa(3))
+            call fa_face_fluxes_x(q, v, nx, ny, 4, j, inv_dx, diffusion, fd(4), fa(4))
+            call fa_face_fluxes_x(q, v, nx, ny, 5, j, inv_dx, diffusion, fd(5), fa(5))
+            dd = inv_dx * ((-11.0_real32 / 12.0_real32) * fd(1) &
+                + (17.0_real32 / 24.0_real32) * fd(2) &
+                + (3.0_real32 / 8.0_real32) * fd(3) &
+                + (-5.0_real32 / 24.0_real32) * fd(4) &
+                + (1.0_real32 / 24.0_real32) * fd(5))
+            da = inv_dx * ((-11.0_real32 / 12.0_real32) * fa(1) &
+                + (17.0_real32 / 24.0_real32) * fa(2) &
+                + (3.0_real32 / 8.0_real32) * fa(3) &
+                + (-5.0_real32 / 24.0_real32) * fa(4) &
+                + (1.0_real32 / 24.0_real32) * fa(5))
+        else if (i + 1 < n) then
+            call fa_face_fluxes_x(q, v, nx, ny, i - 1, j, inv_dx, diffusion, fd(1), fa(1))
+            call fa_face_fluxes_x(q, v, nx, ny, i, j, inv_dx, diffusion, fd(2), fa(2))
+            call fa_face_fluxes_x(q, v, nx, ny, i + 1, j, inv_dx, diffusion, fd(3), fa(3))
+            call fa_face_fluxes_x(q, v, nx, ny, i + 2, j, inv_dx, diffusion, fd(4), fa(4))
+            dd = inv_dx * ((1.0_real32 / 24.0_real32) * fd(1) &
+                + (-9.0_real32 / 8.0_real32) * fd(2) &
+                + (9.0_real32 / 8.0_real32) * fd(3) &
+                + (-1.0_real32 / 24.0_real32) * fd(4))
+            da = inv_dx * ((1.0_real32 / 24.0_real32) * fa(1) &
+                + (-9.0_real32 / 8.0_real32) * fa(2) &
+                + (9.0_real32 / 8.0_real32) * fa(3) &
+                + (-1.0_real32 / 24.0_real32) * fa(4))
+        else
+            call fa_face_fluxes_x(q, v, nx, ny, n - 4, j, inv_dx, diffusion, fd(1), fa(1))
+            call fa_face_fluxes_x(q, v, nx, ny, n - 3, j, inv_dx, diffusion, fd(2), fa(2))
+            call fa_face_fluxes_x(q, v, nx, ny, n - 2, j, inv_dx, diffusion, fd(3), fa(3))
+            call fa_face_fluxes_x(q, v, nx, ny, n - 1, j, inv_dx, diffusion, fd(4), fa(4))
+            call fa_face_fluxes_x(q, v, nx, ny, n, j, inv_dx, diffusion, fd(5), fa(5))
+            dd = inv_dx * ((-1.0_real32 / 24.0_real32) * fd(1) &
+                + (5.0_real32 / 24.0_real32) * fd(2) &
+                + (-3.0_real32 / 8.0_real32) * fd(3) &
+                + (-17.0_real32 / 24.0_real32) * fd(4) &
+                + (11.0_real32 / 12.0_real32) * fd(5))
+            da = inv_dx * ((-1.0_real32 / 24.0_real32) * fa(1) &
+                + (5.0_real32 / 24.0_real32) * fa(2) &
+                + (-3.0_real32 / 8.0_real32) * fa(3) &
+                + (-17.0_real32 / 24.0_real32) * fa(4) &
+                + (11.0_real32 / 12.0_real32) * fa(5))
+        end if
+    end subroutine fa_fused2_div_x
+
+    ! fa_div_face_y of the diffusive (dd) and the advective (da) face
+    ! fluxes of q, each face computed once for both.
+    pure subroutine fa_fused2_div_y(q, v, nx, ny, i, j, inv_dy, diffusion, dd, da)
+        real(real32), intent(in) :: q(:,:), v(:,:)
+        integer, intent(in) :: nx, ny, i, j
+        real(real32), intent(in) :: inv_dy, diffusion
+        real(real32), intent(out) :: dd, da
+        real(real32) :: fd(5), fa(5)
+        integer :: n
+        n = ny + 1
+        if (j == 1) then
+            call fa_face_fluxes_y(q, v, nx, ny, i, 1, inv_dy, diffusion, fd(1), fa(1))
+            call fa_face_fluxes_y(q, v, nx, ny, i, 2, inv_dy, diffusion, fd(2), fa(2))
+            call fa_face_fluxes_y(q, v, nx, ny, i, 3, inv_dy, diffusion, fd(3), fa(3))
+            call fa_face_fluxes_y(q, v, nx, ny, i, 4, inv_dy, diffusion, fd(4), fa(4))
+            call fa_face_fluxes_y(q, v, nx, ny, i, 5, inv_dy, diffusion, fd(5), fa(5))
+            dd = inv_dy * ((-11.0_real32 / 12.0_real32) * fd(1) &
+                + (17.0_real32 / 24.0_real32) * fd(2) &
+                + (3.0_real32 / 8.0_real32) * fd(3) &
+                + (-5.0_real32 / 24.0_real32) * fd(4) &
+                + (1.0_real32 / 24.0_real32) * fd(5))
+            da = inv_dy * ((-11.0_real32 / 12.0_real32) * fa(1) &
+                + (17.0_real32 / 24.0_real32) * fa(2) &
+                + (3.0_real32 / 8.0_real32) * fa(3) &
+                + (-5.0_real32 / 24.0_real32) * fa(4) &
+                + (1.0_real32 / 24.0_real32) * fa(5))
+        else if (j + 1 < n) then
+            call fa_face_fluxes_y(q, v, nx, ny, i, j - 1, inv_dy, diffusion, fd(1), fa(1))
+            call fa_face_fluxes_y(q, v, nx, ny, i, j, inv_dy, diffusion, fd(2), fa(2))
+            call fa_face_fluxes_y(q, v, nx, ny, i, j + 1, inv_dy, diffusion, fd(3), fa(3))
+            call fa_face_fluxes_y(q, v, nx, ny, i, j + 2, inv_dy, diffusion, fd(4), fa(4))
+            dd = inv_dy * ((1.0_real32 / 24.0_real32) * fd(1) &
+                + (-9.0_real32 / 8.0_real32) * fd(2) &
+                + (9.0_real32 / 8.0_real32) * fd(3) &
+                + (-1.0_real32 / 24.0_real32) * fd(4))
+            da = inv_dy * ((1.0_real32 / 24.0_real32) * fa(1) &
+                + (-9.0_real32 / 8.0_real32) * fa(2) &
+                + (9.0_real32 / 8.0_real32) * fa(3) &
+                + (-1.0_real32 / 24.0_real32) * fa(4))
+        else
+            call fa_face_fluxes_y(q, v, nx, ny, i, n - 4, inv_dy, diffusion, fd(1), fa(1))
+            call fa_face_fluxes_y(q, v, nx, ny, i, n - 3, inv_dy, diffusion, fd(2), fa(2))
+            call fa_face_fluxes_y(q, v, nx, ny, i, n - 2, inv_dy, diffusion, fd(3), fa(3))
+            call fa_face_fluxes_y(q, v, nx, ny, i, n - 1, inv_dy, diffusion, fd(4), fa(4))
+            call fa_face_fluxes_y(q, v, nx, ny, i, n, inv_dy, diffusion, fd(5), fa(5))
+            dd = inv_dy * ((-1.0_real32 / 24.0_real32) * fd(1) &
+                + (5.0_real32 / 24.0_real32) * fd(2) &
+                + (-3.0_real32 / 8.0_real32) * fd(3) &
+                + (-17.0_real32 / 24.0_real32) * fd(4) &
+                + (11.0_real32 / 12.0_real32) * fd(5))
+            da = inv_dy * ((-1.0_real32 / 24.0_real32) * fa(1) &
+                + (5.0_real32 / 24.0_real32) * fa(2) &
+                + (-3.0_real32 / 8.0_real32) * fa(3) &
+                + (-17.0_real32 / 24.0_real32) * fa(4) &
+                + (11.0_real32 / 12.0_real32) * fa(5))
+        end if
+    end subroutine fa_fused2_div_y
+
+    ! fa_fused_rhs with each face flux pair computed once.
+    pure real(real32) function fa_fused2_rhs(q, vx, vy, nx, ny, i, j, inv_dx, inv_dy, diffusion) result(rhs)
+        real(real32), intent(in) :: q(:,:), vx(:,:), vy(:,:)
+        integer, intent(in) :: nx, ny, i, j
+        real(real32), intent(in) :: inv_dx, inv_dy, diffusion
+        real(real32) :: dxd, dxa, dyd, dya
+        call fa_fused2_div_x(q, vx, nx, ny, i - 1, j, inv_dx, diffusion, dxd, dxa)
+        call fa_fused2_div_y(q, vy, nx, ny, i, j - 1, inv_dy, diffusion, dyd, dya)
+        rhs = (dxd + dyd) - (dxa + dya)
+    end function fa_fused2_rhs
+
+    ! fa_advance_rk4_fused with fa_fused2_rhs.
+    subroutine fa_advance_rk4_fused2(fields, nx, ny, steps, dt, pi, diffusion)
+        type(fa_fields_t), intent(inout) :: fields
+        integer, intent(in) :: nx, ny, steps
+        real(real32), intent(in) :: dt, pi, diffusion
+        integer :: step, i, j
+        real(real32) :: inv_dx, inv_dy, half_dt, dt_over_6, rhs
+        real(real32), allocatable :: base(:,:), q(:,:), q2(:,:), acc(:,:)
+        real(real32), allocatable :: vx(:,:), vy(:,:)
+
+        inv_dx = real(nx, real32) / (2.0_real32 * pi)
+        inv_dy = real(ny, real32) / (2.0_real32 * pi)
+        half_dt = 0.5_real32 * dt
+        dt_over_6 = dt / 6.0_real32
+        allocate(base(1:nx + 2, 1:ny + 2))
+        allocate(q(1:nx + 2, 1:ny + 2))
+        allocate(q2(1:nx + 2, 1:ny + 2))
+        allocate(acc(1:nx + 2, 1:ny + 2))
+        allocate(vx(1:nx + 1, 1:ny + 2))
+        allocate(vy(1:nx + 2, 1:ny + 1))
+        do concurrent (j = 1:ny + 2, i = 1:nx + 1)
+            vx(i, j) = fields%vx(i, j)
+        end do
+        do concurrent (j = 1:ny + 1, i = 1:nx + 2)
+            vy(i, j) = fields%vy(i, j)
+        end do
+        do concurrent (j = 1:ny + 2, i = 1:nx + 2)
+            base(i, j) = fields%base(i, j)
+            q(i, j) = fields%base(i, j)
+            q2(i, j) = fields%base(i, j)
+            acc(i, j) = 0.0_real32
+        end do
+
+        do step = 1, steps
+            do concurrent (j = 2:ny + 1, i = 2:nx + 1) local(rhs)
+                rhs = fa_fused2_rhs(base, vx, vy, nx, ny, i, j, inv_dx, inv_dy, diffusion)
+                acc(i, j) = rhs
+                q(i, j) = base(i, j) + half_dt * rhs
+            end do
+            do concurrent (j = 2:ny + 1, i = 2:nx + 1) local(rhs)
+                rhs = fa_fused2_rhs(q, vx, vy, nx, ny, i, j, inv_dx, inv_dy, diffusion)
+                acc(i, j) = acc(i, j) + 2.0_real32 * rhs
+                q2(i, j) = base(i, j) + half_dt * rhs
+            end do
+            do concurrent (j = 2:ny + 1, i = 2:nx + 1) local(rhs)
+                rhs = fa_fused2_rhs(q2, vx, vy, nx, ny, i, j, inv_dx, inv_dy, diffusion)
+                acc(i, j) = acc(i, j) + 2.0_real32 * rhs
+                q(i, j) = base(i, j) + dt * rhs
+            end do
+            do concurrent (j = 2:ny + 1, i = 2:nx + 1) local(rhs)
+                rhs = fa_fused2_rhs(q, vx, vy, nx, ny, i, j, inv_dx, inv_dy, diffusion)
+                base(i, j) = base(i, j) + dt_over_6 * (acc(i, j) + rhs)
+            end do
+        end do
+
+        do concurrent (j = 1:ny + 2, i = 1:nx + 2)
+            fields%base(i, j) = base(i, j)
+            fields%q(i, j) = base(i, j)
+            fields%acc(i, j) = 0.0_real32
+        end do
+        deallocate(base, q, q2, acc, vx, vy)
+    end subroutine fa_advance_rk4_fused2
 
     subroutine fa_write_csv(path, fields, nx, ny)
         character(len=*), intent(in) :: path
