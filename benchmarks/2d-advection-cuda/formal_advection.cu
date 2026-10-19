@@ -4181,6 +4181,14 @@ static void fa_run_cuda(const fa_options_t *opt, fa_fields_t *fields,
     fa_cuda_check(cudaStreamSynchronize(stream), "warmup");
     fa_upload_state(&opt->cfg, fields, &d);
     fa_cuda_check(cudaDeviceSynchronize(), "restore");
+    // Page-lock the host copy of the scalar for the final download, which is
+    // part of the timed solve region: pageable copies of 16 MiB ran at only
+    // 3-5 GB/s (3-5 ms at 2048^2).  Falls back to pageable memory.
+    const bool pinned =
+        cudaHostRegister(fields->base, sb, cudaHostRegisterDefault) == cudaSuccess;
+    if (!pinned) {
+        cudaGetLastError();
+    }
     stats->init_seconds = fa_now_seconds() - init_start;
 
     const double solve_start = fa_now_seconds();
@@ -4211,6 +4219,9 @@ static void fa_run_cuda(const fa_options_t *opt, fa_fields_t *fields,
     float busy_ms = 0.0f;
     fa_cuda_check(cudaEventElapsedTime(&busy_ms, ev_start, ev_end), "event elapsed");
     stats->gpu_busy = 1e-3 * (double)busy_ms;
+    if (pinned) {
+        fa_cuda_check(cudaHostUnregister(fields->base), "host unregister");
+    }
     fa_check_finite(fields->base, fields->scalar_len, "final scalar");
     stats->final_all_finite = true;
 

@@ -16,7 +16,11 @@ answer beyond FP32 rounding of fused multiply-adds.
   device-to-host copy of the scalar, after an untimed warm-up step and a
   re-upload of the initial state; initialization, upload and file I/O are
   excluded (the scope of the Metal reference's `solve_wall`).  Medians of
-  5 runs, interleaved per size.
+  5 runs, interleaved per size.  Since `lean2` the host array that receives
+  the final copy is page-locked during initialization (all variants): the
+  pageable copy of 16 MiB took 3.3 ms (5 ms from the padded layout) of the
+  2048² solve region, the page-locked one 0.6 ms.  Rows measured before
+  that change are marked in the tables below.
 - The GPU was shared.  Every timed or profiled run was serialized with
   `flock <lockfile>`, and each timed run additionally waited until
   `nvidia-smi` showed no other compute process.  Unrelated jobs outside the
