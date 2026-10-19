@@ -80,8 +80,9 @@ validated (see [Validation](#validation)).  Solve-wall medians of 5 runs:
 | `prefetch` | 0.0598 | 0.1538 | 1.1725 | all global loads of a tile (velocities, base, accumulator) issued to registers before the first barrier |
 | `regy` | 0.0615 | 0.1400 | 1.1799 | y direction register-blocked: a thread owns 3 consecutive cells of a column and computes their 6 y faces in registers; x faces via shared memory over a flat work list |
 | `regyf` | 0.0544 | **0.1164** | 1.1603 | boundary tiles moved to a separate, concurrent frame kernel; the interior kernel drops all general code (66 → 40 registers) |
-| `pair` | 0.0774 | 0.1786 | **0.6745** | two RK stages per kernel with halo recomputation; stage-1/3 fields never leave the chip; half the DRAM traffic per step |
-| `auto` (default) | 0.0545 | 0.1180 | 0.6806 | `regyf` if 6 fields fit in L2, else `pair` |
+| `pair` | 0.0774 | 0.1786 | 0.6745 | two RK stages per kernel with halo recomputation; stage-1/3 fields never leave the chip; half the DRAM traffic per step |
+| `march` | 0.0977 | 0.1237 | **0.3590** | one kernel per timestep (all four stages): blocks march down column strips with a register pipeline in y; only base and the velocities are read and base written per step (see below) |
+| `auto` (default) | 0.0545 | 0.1180 | 0.3590 | `regyf` if 6 fields fit in L2, else `march` |
 
 Speed-up of the default over LFortran Formal: **4.8x at 2048²** and 1.7x at
 1024².  CUDA Graphs (one graph per timestep) made no measurable difference
@@ -96,6 +97,48 @@ original sweep; `regyf` 32x8 / tile 24 0.1207, 32x6/24 0.1227, 32x8/32
 0.1221, 32x12/24 0.1251, 32x8/16 0.1232, 32x8/48 0.1400; `pair` at 2048²
 tile 26x24 / 32x6 0.171-0.175 vs 58x12 0.179, at 4096² (200 steps) tile
 58x12 / block 64x6 0.1443 s best vs 26x24 0.1549.
+
+### `march`: temporal blocking over the whole timestep
+
+A block of 128 threads owns a strip of 230 columns (each thread two adjacent
+columns, plus the 4 x 3 = 12-column halo of four stages on each side) and a
+segment of 64 rows.  It marches down the segment in chunks of 8 rows,
+starting 12 rows above it: per chunk it loads 8 new rows of base and pushes
+them through all four stages, stage s producing the rows 3s behind the
+newest input.  Each thread carries, per stage and column, the last three
+stage values, y faces and accumulator values from chunk to chunk in
+registers, so the y direction costs one new face per cell and stage; the x
+faces go through shared memory (float2 per thread, one face computed per
+face).  The stage values, rates and the accumulator never leave the chip:
+global memory sees one read of base and the velocities and one write of the
+new base per step (base is double-buffered because neighbouring blocks read
+its halo).  The fields live in a padded device layout (32 ghost points,
+zero, on every side; even pitches), so no load needs a bounds check and a
+thread's column pair moves with one 64-bit access.
+
+Blocks whose dependency cone reaches a boundary run in three concurrent
+frame kernels.  x boundaries are handled per thread (the boundary-side faces
+and the x parts of cells 1 and nx are recomputed with the general rows by
+the block in parallel).  In y the one-sided rows reach five cells, beyond
+the 3-row lag of the pipeline: the top blocks start their march at row -14
+and the bottom blocks at a row congruent to ny - 1 (mod 8), which places
+cells 1..3 (ny-2..ny) of every stage into one chunk whose register window
+holds all seven rows their general rows need (at the bottom up to three rows
+are kept from the previous chunk); those cells take their y part from the
+general rows.  Frame tiles are split into `--frame-parts` (default 2) row
+parts so that they finish with the interior blocks.
+
+At 4096² `march` moves 278 MB of DRAM traffic per step (`pair`: 747 MB) and
+is 1.92x faster than `pair` (interleaved, 5 runs each: 0.345-0.360 s vs
+0.683-0.695 s).  At 2048² it executes 48 M warp instructions and 303 MB of
+L2 traffic per step against 110 M and 619 MB for `regyf`, but it is latency
+bound (about 2 warps per scheduler at 239-255 registers, with long
+global-load and barrier waits): it issues on only ~21% of the cycles and
+ends up level with `regyf`.  At 1024² there are too few columns to fill the
+GPU without very short segments, whose 12-row warm-up dominates.  Sweeps
+(2048², s): block 128 / tile-y 48 / 3 parts 0.119, 96/4 parts 0.119,
+32/2 0.122, 64/2 0.124; block 64 0.128-0.153; 4096² (200 steps): 128/64/2
+0.0744, 128/48/1 0.0839, 64/128/2 0.0869.
 
 Rejected experiments (in commit `d353184`): a shared-memory-free "stream"
 kernel (warps walking 26-column strips with shuffles in x and a register
@@ -164,7 +207,7 @@ but costs more instructions than it saves while the data is L2 resident.
 ## Validation
 
 Every variant (`split`, `fused`, `tiled`, `prefetch`, `regy`, `regyf`,
-`pair`, `auto`) passed the strict raw comparator (`rtol=1e-6`, `atol=1e-8`
+`pair`, `march`, `auto`) passed the strict raw comparator (`rtol=1e-6`, `atol=1e-8`
 at every point, exact fixed boundaries, `--evolution`) against both the
 native CPU oracle and the LFortran-compiled Formal final on:
 
@@ -177,7 +220,17 @@ native CPU oracle and the LFortran-compiled Formal final on:
   (CPU oracle run for the full 1000 steps).
 
 `compute-sanitizer` (memcheck) reported no errors for any variant on
-13x11, 37x23, 130x67, 257x257, 1000x999, 61x1000 and 4096x4096.  At
+13x11, 37x23, 130x67, 257x257, 1000x999, 61x1000 and 4096x4096.
+
+`march` (whose boundary handling only runs when `ny >= tile-y + 12`; the
+smallest cases above fall back to `regyf`) was additionally validated with
+several geometries (`--block 64/96/128`, `--tile-y 24..64`,
+`--frame-parts 1..3`) on nonzero, non-smooth-boundary random-velocity inputs
+61x83, 64x64, 130x97, 333x251, 517x1031 and 1100x300 (10 steps, written by
+the LFortran recipe's `make_boundary_input.py`; compared against the CPU
+oracle with the same strict comparator), on all the cases above, and under
+`compute-sanitizer` memcheck, racecheck and synccheck.  At 4096² it agrees
+with `split` within max abs diff 4.2e-7, relative L2 5.4e-8.  At
 4096² (no Formal or CPU final available) `regyf` and `pair` agree with
 `split` within the same tolerances (max abs diff 4.2e-7, relative L2
 4.9e-8 / 5.5e-8).

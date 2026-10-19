@@ -63,6 +63,7 @@ typedef enum {
     FA_KERNEL_REGY,
     FA_KERNEL_REGYF,
     FA_KERNEL_PAIR,
+    FA_KERNEL_MARCH,
     FA_KERNEL_AUTO,
     FA_KERNEL_COUNT_
 } fa_kernel_t;
@@ -75,6 +76,7 @@ static const char *FA_KERNEL_NAMES[FA_KERNEL_COUNT_] = {
     "regy",
     "regyf",
     "pair",
+    "march",
     "auto",
 };
 
@@ -94,6 +96,7 @@ typedef struct {
     uint32_t tile_y;
     fa_kernel_t kernel;
     bool graph;
+    uint32_t frame_parts;
 } fa_options_t;
 
 typedef struct {
@@ -862,6 +865,19 @@ __global__ void fa_split_update(float *base, float *stage_out, float *accum,
 // Host CUDA driver.
 // ---------------------------------------------------------------------------
 
+// Padded device copies of base (double-buffered) and the velocities used by
+// "march": FA_M_PAD ghost points (zeros) on every side, pitches rounded up to
+// 32 floats; base[k], vx and vy point at element (0, 0).
+constexpr int FA_M_PAD = 32;
+typedef struct {
+    float *alloc[4];
+    float *base[2];
+    float *vx;
+    float *vy;
+    int ps;
+    int pf;
+} fa_mfields_t;
+
 typedef struct {
     float *base;
     float *base_alt;
@@ -876,6 +892,10 @@ typedef struct {
     cudaStream_t side;
     cudaEvent_t fork;
     cudaEvent_t join;
+    cudaStream_t mside[3];
+    cudaEvent_t mjoin[3];
+    fa_mfields_t m;
+    int march_parts;
 } fa_device_t;
 
 static fa_stage_params_t fa_stage_params(const fa_config_t *cfg, int stage)
@@ -2067,6 +2087,660 @@ static void fa_launch_pair(const fa_config_t *cfg, fa_device_t *d, int parity,
     }
 }
 
+// One-sided first and last rows of the divergence (the i == 0 and last
+// branches of fa_t_div), on face values held in registers.
+__device__ __forceinline__ float fa_div_first(float f0, float f1, float f2, float f3,
+    float f4, float inv_h)
+{
+    return (((-11.0f / 12.0f) * inv_h) * f0 +
+            ((17.0f / 24.0f) * inv_h) * f1 +
+            ((3.0f / 8.0f) * inv_h) * f2 +
+            ((-5.0f / 24.0f) * inv_h) * f3 +
+            ((1.0f / 24.0f) * inv_h) * f4);
+}
+
+__device__ __forceinline__ float fa_div_last(float f0, float f1, float f2, float f3,
+    float f4, float inv_h)
+{
+    return (((-1.0f / 24.0f) * inv_h) * f0 +
+            ((5.0f / 24.0f) * inv_h) * f1 +
+            ((-3.0f / 8.0f) * inv_h) * f2 +
+            ((-17.0f / 24.0f) * inv_h) * f3 +
+            ((11.0f / 12.0f) * inv_h) * f4);
+}
+
+// 0.5f * fa_grad_interior(...) with the exact factor 0.5 folded into the
+// coefficients: the same value bit for bit, one multiplication less.
+__device__ __forceinline__ float fa_hgrad_interior(float a, float b, float c, float d,
+    float inv_h)
+{
+    return (((0.5f / 24.0f) * inv_h) * a + ((-0.5f * 9.0f / 8.0f) * inv_h) * b +
+            ((0.5f * 9.0f / 8.0f) * inv_h) * c + ((-0.5f / 24.0f) * inv_h) * d);
+}
+
+// Diffusive and advective face values of the five boundary-side faces from
+// seven consecutive rows (or columns) `v`, with the general operator rows.
+// TOP: v = points 0..6, faces 0..4.  Otherwise (bottom/right): v = points
+// n-6..n (n = last point), faces n-5..n-1.
+template <bool TOP>
+__device__ __forceinline__ void fa_edge_faces(const float (&v)[7], const float (&vel)[5],
+    float inv_h, float (&fd)[5], float (&fa)[5])
+{
+    const auto at = [&](int k) { return v[TOP ? k : k + 2]; };
+#pragma unroll
+    for (int q = 0; q < 5; ++q) {
+        // Face index within a virtual line of 5 + 2 points: the one-sided
+        // faces are the first two (TOP) or the last two (bottom).
+        if (TOP && q < 2) {
+            fd[q] = 0.5f * fa_t_grad(at, 5, q, inv_h);
+            fa[q] = vel[q] * fa_t_interp(at, 5, q);
+        } else if (!TOP && q >= 3) {
+            fd[q] = 0.5f * fa_t_grad(at, 5, q - 1, inv_h);
+            fa[q] = vel[q] * fa_t_interp(at, 5, q - 1);
+        } else {
+            const int o = TOP ? q - 1 : q;      // first point of the interior row
+            fd[q] = 0.5f * fa_grad_interior(v[o], v[o + 1], v[o + 2], v[o + 3], inv_h);
+            fa[q] = vel[q] * fa_interp_interior(v[o], v[o + 1], v[o + 2], v[o + 3]);
+        }
+    }
+}
+
+// Variant "march": one kernel per timestep with all four RK stages fused
+// (temporal blocking).  A block of NT = 32*NW threads owns a strip of
+// W = 2*NT - 26 columns and a segment of H rows.  Thread t holds the two
+// adjacent columns c0 - 13 + 2t and c0 - 12 + 2t, i.e. the strip plus the
+// 4 x 3 column halo the four stages need.  The block marches down its
+// segment in chunks of R = 8 rows, starting 12 rows above it: per chunk it
+// loads R new rows of base and pushes them through the four stages, stage s
+// producing rows 3s behind the newest input rows.  Stage values, the RK
+// accumulator and the stage rates never leave the chip: global traffic per
+// timestep is one read of base and of the velocities per stage (mostly L1
+// hits) and one write of the new base, which is double-buffered because
+// neighbouring blocks read its halo.  Values outside the shrinking valid
+// region are garbage that is never stored.
+//
+// y direction in registers: every thread carries, per stage and column, the
+// last three stage values and y faces from chunk to chunk and evaluates R new
+// y faces per chunk.  x direction through shared memory: rows and faces move
+// as float2, each thread keeps its own two values and faces in registers.
+//
+// The fields use a padded device layout (FA_M_PAD ghost points on every
+// side, even pitches): loads never need bounds checks, and the column pair
+// of a thread is 8-byte aligned, so it moves with one 64-bit load.
+//
+// Boundaries (frame blocks only, FRAME = true): the boundary-side x faces
+// and the x parts of cells 1 and nx are recomputed from the general rows by
+// the block in parallel after the interior-row pass.  In y the one-sided
+// rows reach five cells; a block containing the top (YM = 1) starts its march
+// at row -14 and a block whose dependency cone reaches the bottom (YM = 2) at
+// a row r0 = ny - 1 (mod 8), which puts cells 1..3 (ny-2..ny) of every stage
+// into one chunk whose window holds the seven rows their general rows need
+// (at the bottom up to three rows are captured from the previous chunk).
+// These cells take their y part from the general rows.
+constexpr int FA_M_R = 8;
+
+struct fa_mptr_t {
+    const float *bin;   // element (0, 0) of the padded fields
+    float *bout;
+    const float *vx;
+    const float *vy;
+    int ps;             // pitch of the scalars and vy
+    int pf;             // pitch of vx
+};
+
+struct fa_march_geo_t {
+    int c;              // global column of the thread's first column (even)
+    int cl;             // global column of local column 0
+    int r0;             // first input row of the march
+    int y_lo;           // owned rows [y_lo, y_hi), columns [c_lo, c_hi)
+    int y_hi;
+    int c_lo;
+    int c_hi;
+    bool xgen;          // the strip contains boundary-side columns
+};
+
+// Top/bottom special chunks: stage S handles the cells next to the boundary
+// in the chunk with b = fa_top_b(S) (top, r0 = -14) or b = ny - fa_bot_d(S)
+// (bottom, ny - r0 = 1 (mod 8)).
+__device__ constexpr int fa_top_b(int s) { return s == 1 ? -1 : s == 2 ? -4 : s == 3 ? 1 : -2; }
+__device__ constexpr int fa_bot_d(int s) { return s == 1 ? 4 : s == 2 ? 7 : s == 3 ? 2 : 5; }
+
+__device__ __forceinline__ float2 fa_ld2(const float *p)
+{
+    return __ldg(reinterpret_cast<const float2 *>(p));
+}
+
+template <int NW, int S, bool FRAME, int YM>
+__device__ __forceinline__ void fa_m2_stage(int a, int t, const fa_march_geo_t &g,
+    const fa_step_params_t &p, const fa_mptr_t &m, float (*xb)[64 * NW + 8],
+    float (*fd)[64 * NW + 8], float (*fa)[64 * NW + 8], float (*xs)[2][FA_M_R],
+    float (&cur)[2][FA_M_R], float (&accv)[2][FA_M_R], float (&rc)[2][3],
+    float (&ydc)[2][3], float (&yac)[2][3], float (&ac)[2][3], float (&cap)[2][3])
+{
+    constexpr int R = FA_M_R;
+    constexpr int NT = 32 * NW;
+    const int nx = p.nx;
+    const int ny = p.ny;
+    const int ps = m.ps;
+    const int c = g.c;
+    const int b = a - 3 * S;            // output rows [b, b + R)
+
+    // Stage-input rows [b, b + R + 3) (three carried) and y faces
+    // [b - 2, b + R + 1) (three carried, R new; face f uses rows f-1 .. f+2).
+    float w[2][R + 3];
+    float yd[2][R + 3];
+    float ya[2][R + 3];
+#pragma unroll
+    for (int e = 0; e < 2; ++e) {
+#pragma unroll
+        for (int q = 0; q < 3; ++q) {
+            w[e][q] = rc[e][q];
+            yd[e][q] = ydc[e][q];
+            ya[e][q] = yac[e][q];
+        }
+#pragma unroll
+        for (int q = 0; q < R; ++q) {
+            w[e][q + 3] = cur[e][q];
+        }
+#pragma unroll
+        for (int q = 0; q < 3; ++q) {
+            rc[e][q] = w[e][R + q];
+        }
+    }
+#pragma unroll
+    for (int q = 0; q < R; ++q) {
+        const float2 v = fa_ld2(m.vy + c + ps * (b + 1 + q));
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+            yd[e][q + 3] = fa_hgrad_interior(w[e][q], w[e][q + 1], w[e][q + 2], w[e][q + 3],
+                p.inv_dy);
+            ya[e][q + 3] = (e ? v.y : v.x) * fa_interp_interior(w[e][q], w[e][q + 1],
+                w[e][q + 2], w[e][q + 3]);
+        }
+    }
+#pragma unroll
+    for (int e = 0; e < 2; ++e) {
+#pragma unroll
+        for (int q = 0; q < 3; ++q) {
+            ydc[e][q] = yd[e][R + q];
+            yac[e][q] = ya[e][R + q];
+        }
+    }
+
+    // y parts of the cells next to a y boundary (general rows).
+    float sdy[2][3];
+    float say[2][3];
+    constexpr int BT = fa_top_b(S);
+    constexpr int DB = fa_bot_d(S);
+    if (YM == 2 && DB < 5 && b == ny - DB - R) {
+        // Rows ny-5 .. ny-DB-1 leave the window before the special chunk.
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+#pragma unroll
+            for (int i = 0; i < 5 - DB; ++i) {
+                cap[e][i] = w[e][DB + R - 5 + i];
+            }
+        }
+    }
+    const bool top_chunk = YM == 1 && b == BT;
+    const bool bot_chunk = YM == 2 && b == ny - DB;
+    if (top_chunk || bot_chunk) {
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+            const int ce = c + e;
+            float v[7];
+            float vel[5];
+            float ffd[5];
+            float ffa[5];
+            if (YM == 1) {
+                // Rows 0..6: row 0 is the fixed boundary (= base).
+                v[0] = __ldg(m.bin + ce);
+#pragma unroll
+                for (int i = 1; i < 7; ++i) {
+                    v[i] = w[e][i - BT];
+                }
+#pragma unroll
+                for (int q = 0; q < 5; ++q) {
+                    vel[q] = __ldg(m.vy + ce + ps * q);
+                }
+                fa_edge_faces<true>(v, vel, p.inv_dy, ffd, ffa);
+                // cells 1, 2, 3
+                sdy[e][0] = fa_div_first(ffd[0], ffd[1], ffd[2], ffd[3], ffd[4], p.inv_dy);
+                say[e][0] = fa_div_first(ffa[0], ffa[1], ffa[2], ffa[3], ffa[4], p.inv_dy);
+                sdy[e][1] = fa_div_interior(ffd[0], ffd[1], ffd[2], ffd[3], p.inv_dy);
+                say[e][1] = fa_div_interior(ffa[0], ffa[1], ffa[2], ffa[3], p.inv_dy);
+                sdy[e][2] = fa_div_interior(ffd[1], ffd[2], ffd[3], ffd[4], p.inv_dy);
+                say[e][2] = fa_div_interior(ffa[1], ffa[2], ffa[3], ffa[4], p.inv_dy);
+            } else {
+                // Rows ny-5 .. ny+1: row ny+1 is the fixed boundary.
+#pragma unroll
+                for (int i = 0; i < 6; ++i) {
+                    // row ny - 5 + i is at window index DB - 5 + i
+                    v[i] = (DB - 5 + i >= 0) ? w[e][max(DB - 5 + i, 0)] :
+                        cap[e][min(i, 2)];
+                }
+                v[6] = __ldg(m.bin + ce + ps * (ny + 1));
+#pragma unroll
+                for (int q = 0; q < 5; ++q) {
+                    vel[q] = __ldg(m.vy + ce + ps * (ny - 4 + q));
+                }
+                fa_edge_faces<false>(v, vel, p.inv_dy, ffd, ffa);
+                // cells ny-2, ny-1, ny (faces ny-4 .. ny = ffd[0..4])
+                sdy[e][0] = fa_div_interior(ffd[0], ffd[1], ffd[2], ffd[3], p.inv_dy);
+                say[e][0] = fa_div_interior(ffa[0], ffa[1], ffa[2], ffa[3], p.inv_dy);
+                sdy[e][1] = fa_div_interior(ffd[1], ffd[2], ffd[3], ffd[4], p.inv_dy);
+                say[e][1] = fa_div_interior(ffa[1], ffa[2], ffa[3], ffa[4], p.inv_dy);
+                sdy[e][2] = fa_div_last(ffd[0], ffd[1], ffd[2], ffd[3], ffd[4], p.inv_dy);
+                say[e][2] = fa_div_last(ffa[0], ffa[1], ffa[2], ffa[3], ffa[4], p.inv_dy);
+            }
+        }
+    }
+
+    // x faces of rows [b, b + R): faces c and c + 1 of this thread.
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        *reinterpret_cast<float2 *>(&xb[r][2 * t + 4]) = make_float2(w[0][r], w[1][r]);
+    }
+    __syncthreads();
+    float od[R][2];
+    float oa[R][2];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const float sm = xb[r][2 * t + 3];
+        const float2 sp = *reinterpret_cast<const float2 *>(&xb[r][2 * t + 6]);
+        const float2 v = fa_ld2(m.vx + c + m.pf * (b + r));
+        od[r][0] = fa_hgrad_interior(sm, w[0][r], w[1][r], sp.x, p.inv_dx);
+        od[r][1] = fa_hgrad_interior(w[0][r], w[1][r], sp.x, sp.y, p.inv_dx);
+        oa[r][0] = v.x * fa_interp_interior(sm, w[0][r], w[1][r], sp.x);
+        oa[r][1] = v.y * fa_interp_interior(w[0][r], w[1][r], sp.x, sp.y);
+        *reinterpret_cast<float2 *>(&fd[r][2 * t + 4]) = make_float2(od[r][0], od[r][1]);
+        *reinterpret_cast<float2 *>(&fa[r][2 * t + 4]) = make_float2(oa[r][0], oa[r][1]);
+    }
+    if (FRAME && g.xgen) {
+        // Boundary-side x faces (0, 1, nx-1, nx) from the general rows, one
+        // (face, row) item per thread, then the x parts of cells 1 and nx.
+        static_assert(NT >= 4 * R, "fix-up needs 4R threads");
+        __syncthreads();
+        if (t < 4 * R) {
+            const int k = t / R;
+            const int r = t % R;
+            const int f = k == 0 ? 0 : k == 1 ? 1 : k == 2 ? nx - 1 : nx;
+            const int l = f - g.cl;
+            if (l >= 0 && l < 2 * NT) {
+                const fa_sline_t row = {&xb[r][0], g.cl - 4, 1};
+                const float v = __ldg(m.vx + f + m.pf * (b + r));
+                fd[r][l + 4] = 0.5f * fa_t_grad(row, nx + 2, f, p.inv_dx);
+                fa[r][l + 4] = v * fa_t_interp(row, nx + 2, f);
+            }
+        }
+        __syncthreads();
+        if (t < 4 * R) {
+            const int which = t / (2 * R);
+            const int kind = (t / R) % 2;
+            const int r = t % R;
+            const int cell = which ? nx : 1;
+            const int l = cell - g.cl;
+            if (l >= 0 && l < 2 * NT) {
+                const fa_sline_t row = {kind ? &fa[r][0] : &fd[r][0], g.cl - 4, 1};
+                xs[which][kind][r] = fa_t_div(row, nx + 1, cell - 1, p.inv_dx);
+            }
+        }
+    }
+    __syncthreads();
+
+    // Accumulator rows [b, b + R): three carried, R - 3 from the previous
+    // stage's current outputs.
+    float aw[2][R];
+    if (S > 1) {
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+#pragma unroll
+            for (int q = 0; q < 3; ++q) {
+                aw[e][q] = ac[e][q];
+            }
+#pragma unroll
+            for (int q = 3; q < R; ++q) {
+                aw[e][q] = accv[e][q - 3];
+            }
+#pragma unroll
+            for (int q = 0; q < 3; ++q) {
+                ac[e][q] = accv[e][R - 3 + q];
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int j = b + r;
+        const float2 dm = *reinterpret_cast<const float2 *>(&fd[r][2 * t + 2]);
+        const float dp = fd[r][2 * t + 6];
+        const float2 am = *reinterpret_cast<const float2 *>(&fa[r][2 * t + 2]);
+        const float ap = fa[r][2 * t + 6];
+        if (FRAME && g.xgen) {
+            // Own faces may have been replaced by the general rows.
+            const float2 d0 = *reinterpret_cast<const float2 *>(&fd[r][2 * t + 4]);
+            const float2 a0 = *reinterpret_cast<const float2 *>(&fa[r][2 * t + 4]);
+            od[r][0] = d0.x;
+            od[r][1] = d0.y;
+            oa[r][0] = a0.x;
+            oa[r][1] = a0.y;
+        }
+        float diffx[2], advx[2];
+        diffx[0] = fa_div_interior(dm.x, dm.y, od[r][0], od[r][1], p.inv_dx);
+        diffx[1] = fa_div_interior(dm.y, od[r][0], od[r][1], dp, p.inv_dx);
+        advx[0] = fa_div_interior(am.x, am.y, oa[r][0], oa[r][1], p.inv_dx);
+        advx[1] = fa_div_interior(am.y, oa[r][0], oa[r][1], ap, p.inv_dx);
+        const float2 bj2 = fa_ld2(m.bin + c + ps * j);
+        float out[2];
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+            const int ce = c + e;
+            if (FRAME && (ce == 1 || ce == nx)) {
+                diffx[e] = xs[ce == 1 ? 0 : 1][0][r];
+                advx[e] = xs[ce == 1 ? 0 : 1][1][r];
+            }
+            float diffy = fa_div_interior(yd[e][r], yd[e][r + 1], yd[e][r + 2],
+                yd[e][r + 3], p.inv_dy);
+            float advy = fa_div_interior(ya[e][r], ya[e][r + 1], ya[e][r + 2],
+                ya[e][r + 3], p.inv_dy);
+            if (YM == 1 && r >= 1 - BT && r <= 3 - BT && top_chunk) {
+                diffy = sdy[e][r - (1 - BT)];
+                advy = say[e][r - (1 - BT)];
+            }
+            if (YM == 2 && r >= DB - 2 && r <= DB && bot_chunk) {
+                diffy = sdy[e][r - (DB - 2)];
+                advy = say[e][r - (DB - 2)];
+            }
+            const float rhs = (diffx[e] + diffy) - (advx[e] + advy);
+            const float bj = e ? bj2.y : bj2.x;
+            // Boundary and ghost points keep base (frame blocks only).
+            const bool cell = !FRAME || (ce >= 1 && ce <= nx && (YM == 0 || (j >= 1 && j <= ny)));
+            if (S == 1) {
+                accv[e][r] = rhs;
+                cur[e][r] = cell ? bj + p.dt_half * rhs : bj;
+            } else if (S == 2) {
+                accv[e][r] = aw[e][r] + 2.0f * rhs;
+                cur[e][r] = cell ? bj + p.dt_half * rhs : bj;
+            } else if (S == 3) {
+                accv[e][r] = aw[e][r] + 2.0f * rhs;
+                cur[e][r] = cell ? bj + p.dt * rhs : bj;
+            } else {
+                out[e] = bj + p.dt_over_6 * (aw[e][r] + rhs);
+            }
+        }
+        if (S == 4 && j >= g.y_lo && j < g.y_hi) {
+            const bool o0 = c >= g.c_lo && c < g.c_hi;
+            const bool o1 = c + 1 >= g.c_lo && c + 1 < g.c_hi;
+            if (o0 && o1) {
+                *reinterpret_cast<float2 *>(m.bout + c + ps * j) = make_float2(out[0], out[1]);
+            } else if (o0) {
+                m.bout[c + ps * j] = out[0];
+            } else if (o1) {
+                m.bout[c + 1 + ps * j] = out[1];
+            }
+        }
+    }
+}
+
+// The march of one block: chunks k = 0 .. K-1; stage s is skipped while its
+// current and next chunks are below its valid rows ((k + 2) R <= 6 s, plus
+// the extra warm-up rows of r0).
+template <int NW, bool FRAME, int YM>
+__device__ __forceinline__ void fa_m2_run(const fa_march_geo_t &g, int K,
+    const fa_step_params_t &p, const fa_mptr_t &m, float (*xb)[64 * NW + 8],
+    float (*fd)[64 * NW + 8], float (*fa)[64 * NW + 8])
+{
+    constexpr int R = FA_M_R;
+    __shared__ float xs[2][2][R];       // x parts of cells 1 and nx (frame)
+    const int t = threadIdx.x;
+    float rc[4][2][3], ydc[4][2][3], yac[4][2][3], ac[4][2][3], cap[4][2][3];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+#pragma unroll
+            for (int q = 0; q < 3; ++q) {
+                rc[s][e][q] = 0.0f;
+                ydc[s][e][q] = 0.0f;
+                yac[s][e][q] = 0.0f;
+                ac[s][e][q] = 0.0f;
+                cap[s][e][q] = 0.0f;
+            }
+        }
+    }
+    const int skip = g.y_lo - 12 - g.r0;
+    for (int k = 0; k < K; ++k) {
+        const int a = g.r0 + k * R;
+        float cur[2][R];
+        float accv[2][R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const float2 v = fa_ld2(m.bin + g.c + m.ps * (a + r));
+            cur[0][r] = v.x;
+            cur[1][r] = v.y;
+            accv[0][r] = 0.0f;
+            accv[1][r] = 0.0f;
+        }
+        const int kr = (k + 2) * R - skip;
+        fa_m2_stage<NW, 1, FRAME, YM>(a, t, g, p, m, xb, fd, fa, xs, cur, accv, rc[0],
+            ydc[0], yac[0], ac[0], cap[0]);
+        if (kr > 12) {
+            fa_m2_stage<NW, 2, FRAME, YM>(a, t, g, p, m, xb, fd, fa, xs, cur, accv, rc[1],
+                ydc[1], yac[1], ac[1], cap[1]);
+        }
+        if (kr > 18) {
+            fa_m2_stage<NW, 3, FRAME, YM>(a, t, g, p, m, xb, fd, fa, xs, cur, accv, rc[2],
+                ydc[2], yac[2], ac[2], cap[2]);
+        }
+        if (kr > 24) {
+            fa_m2_stage<NW, 4, FRAME, YM>(a, t, g, p, m, xb, fd, fa, xs, cur, accv, rc[3],
+                ydc[3], yac[3], ac[3], cap[3]);
+        }
+    }
+}
+
+template <int NW>
+__device__ __forceinline__ void fa_m2_smem_init(float (*xb)[64 * NW + 8],
+    float (*fd)[64 * NW + 8], float (*fa)[64 * NW + 8])
+{
+    constexpr int XS = 64 * NW + 8;
+    for (int q = threadIdx.x; q < FA_M_R * XS; q += 32 * NW) {
+        (&xb[0][0])[q] = 0.0f;
+        (&fd[0][0])[q] = 0.0f;
+        (&fa[0][0])[q] = 0.0f;
+    }
+    __syncthreads();
+}
+
+// Interior blocks: every point of the dependency cone uses the interior rows.
+template <int NW>
+__global__ void __launch_bounds__(32 * NW)
+fa_march_fast(fa_mptr_t m, fa_step_params_t p, fa_tiles_t tiles, int H)
+{
+    constexpr int W = 64 * NW - 26;
+    __shared__ __align__(16) float xb[FA_M_R][64 * NW + 8];
+    __shared__ __align__(16) float fd[FA_M_R][64 * NW + 8];
+    __shared__ __align__(16) float fa[FA_M_R][64 * NW + 8];
+    fa_m2_smem_init<NW>(xb, fd, fa);
+    const int c0 = 1 + (tiles.bx_lo + (int)blockIdx.x) * W;
+    const int y0 = 1 + (tiles.by_lo + (int)blockIdx.y) * H;
+    fa_march_geo_t g;
+    g.cl = c0 - 13;
+    g.c = g.cl + 2 * (int)threadIdx.x;
+    g.r0 = y0 - 12;
+    g.y_lo = y0;
+    g.y_hi = y0 + H;
+    g.c_lo = c0;
+    g.c_hi = c0 + W;
+    g.xgen = false;
+    fa_m2_run<NW, false, 0>(g, (H + 24) / FA_M_R, p, m, xb, fd, fa);
+}
+
+// Frame blocks: strips and segments whose cone reaches a boundary, in three
+// classes launched as separate kernels: the top segment row (YM = 1), the
+// segment rows whose cone reaches the bottom (YM = 2, rows >= by_b0) and the
+// remaining non-interior blocks (YM = 0).  The last strip is shifted to end
+// at the last column (rounded to keep its columns pairs aligned) and writes
+// only the columns it owns; segments are not shifted (the bottom march simply
+// runs to row ny).
+struct fa_march_map_t {
+    fa_tiles_t t;       // interior rectangle (empty: bx_lo > bx_hi)
+    int by_b0;          // first segment row of the bottom class
+    int parts;          // frame tiles are split into this many row parts
+};
+
+__device__ __forceinline__ void fa_march_frame_tile(const fa_march_map_t &mm, int ym,
+    int k, int &bx, int &by)
+{
+    const int nbx = mm.t.nbx;
+    if (ym == 1) {
+        bx = k;
+        by = 0;
+    } else if (ym == 2) {
+        bx = k % nbx;
+        by = mm.by_b0 + k / nbx;
+    } else {
+        // Rows [1, by_b0): the blocks beside the interior rectangle, then
+        // the full rows below it.
+        const int nint = mm.t.bx_hi - mm.t.bx_lo + 1;
+        const int rows = mm.t.by_hi - mm.t.by_lo + 1;
+        const bool has = nint > 0 && rows > 0;
+        const int side = nbx - nint;
+        if (has && k < rows * side) {
+            by = mm.t.by_lo + k / side;
+            const int c = k % side;
+            bx = c < mm.t.bx_lo ? c : mm.t.bx_hi + 1 + (c - mm.t.bx_lo);
+        } else {
+            if (has) {
+                k -= rows * side;
+            }
+            bx = k % nbx;
+            by = (has ? mm.t.by_hi + 1 : 1) + k / nbx;
+        }
+    }
+}
+
+template <int NW, int YM>
+__global__ void __launch_bounds__(32 * NW)
+fa_march_frame(fa_mptr_t m, fa_step_params_t p, fa_march_map_t mm, int H)
+{
+    constexpr int R = FA_M_R;
+    constexpr int W = 64 * NW - 26;
+    __shared__ __align__(16) float xb[R][64 * NW + 8];
+    __shared__ __align__(16) float fd[R][64 * NW + 8];
+    __shared__ __align__(16) float fa[R][64 * NW + 8];
+    fa_m2_smem_init<NW>(xb, fd, fa);
+    const int nx = p.nx;
+    const int ny = p.ny;
+    int bx, by;
+    fa_march_frame_tile(mm, YM, (int)blockIdx.x / mm.parts, bx, by);
+    const int part = (int)blockIdx.x % mm.parts;
+    const int hp = (H + mm.parts - 1) / mm.parts;
+    fa_march_geo_t g;
+    g.c_lo = 1 + bx * W;
+    g.c_hi = min(g.c_lo + W, nx + 1);
+    int c0 = min(g.c_lo, max(1, nx - W + 1));
+    c0 += 1 - (c0 & 1);                 // odd: even column pairs
+    g.cl = c0 - 13;
+    g.c = g.cl + 2 * (int)threadIdx.x;
+    g.xgen = g.cl <= 1 || g.cl + 64 * NW - 1 >= nx - 1;
+    const int tile_hi = min(1 + (by + 1) * H, ny + 1);
+    g.y_lo = 1 + by * H + part * hp;
+    g.y_hi = min(g.y_lo + hp, tile_hi);
+    if (g.y_lo >= g.y_hi) {
+        return;
+    }
+    // r0: 12 warm-up rows, aligned to -14 (mod 8) at the top and to ny - 1
+    // (mod 8) at the bottom so that the special chunks line up; the march
+    // ends once stage 4 has passed y_hi (and, if the cone reaches the
+    // bottom, the stage-4 special chunk a = ny + 7).
+    const int lo = g.y_lo - 12;
+    const int ref = YM == 1 ? -14 : YM == 2 ? ny - 1 : lo;
+    g.r0 = YM == 1 && g.y_lo == 1 ? -14 : lo - (((lo - ref) % R) + R) % R;
+    int a_end = g.y_hi + 4;
+    if (YM == 2 && g.y_hi >= ny - 10) {
+        a_end = max(a_end, ny + 7);
+    }
+    const int K = (a_end - g.r0 + R - 1) / R + 1;
+    fa_m2_run<NW, true, YM>(g, K, p, m, xb, fd, fa);
+}
+
+// Tiling of "march": strips of W = 64*NW - 26 columns, segments of H rows.
+// Interior block (bx, by): c0 = 1 + bx*W >= 13, c0 + W <= nx - 11 and
+// y0 = 1 + by*H >= 25 (keeps the warm-up rows inside the domain),
+// y0 + H <= ny - 11.  Returns false if the grid is too small (a segment
+// would contain both y boundaries' cones).
+template <int NW>
+static bool fa_march_tiles(int nx, int ny, int H, fa_march_map_t *mm, int *interior,
+    int *frame)
+{
+    constexpr int W = 64 * NW - 26;
+    if (ny < H + 12 || H % FA_M_R != 0 || H < 24) {
+        return false;
+    }
+    fa_tiles_t *t = &mm->t;
+    *t = fa_make_tiles((nx + W - 1) / W, (ny + H - 1) / H, (nx - 12 - W) / W,
+        (ny - 12 - H) / H, interior, frame);
+    const int lo = (24 + H - 1) / H;
+    if (*interior > 0 && lo > t->by_lo) {
+        if (lo > t->by_hi) {
+            *t = fa_make_tiles(t->nbx, t->nby, 0, 0, interior, frame);
+        } else {
+            t->by_lo = lo;
+            *interior = (t->bx_hi - t->bx_lo + 1) * (t->by_hi - t->by_lo + 1);
+            *frame = t->nbx * t->nby - *interior;
+        }
+    }
+    // Bottom class: segment rows with y_hi >= ny - 10.
+    mm->by_b0 = t->nby - 1;
+    while (mm->by_b0 > 1 && 1 + mm->by_b0 * H >= ny - 10) {
+        --mm->by_b0;
+    }
+    return true;
+}
+
+template <int NW>
+static void fa_launch_march(const fa_config_t *cfg, fa_device_t *d, int parity, int H,
+    cudaStream_t s)
+{
+    const int nx = (int)cfg->nx;
+    const int ny = (int)cfg->ny;
+    int interior, frame;
+    fa_march_map_t mm;
+    if (!fa_march_tiles<NW>(nx, ny, H, &mm, &interior, &frame)) {
+        fa_die("march: grid too small for --tile-y");
+    }
+    mm.parts = d->march_parts;
+    const int ntop = mm.t.nbx * mm.parts;
+    const int nbot = (mm.t.nby - mm.by_b0) * mm.t.nbx * mm.parts;
+    const int nmid = (frame - mm.t.nbx - (mm.t.nby - mm.by_b0) * mm.t.nbx) * mm.parts;
+    const fa_step_params_t p = fa_step_params(cfg);
+    fa_mptr_t m;
+    m.bin = d->m.base[parity];
+    m.bout = d->m.base[parity ^ 1];
+    m.vx = d->m.vx;
+    m.vy = d->m.vy;
+    m.ps = d->m.ps;
+    m.pf = d->m.pf;
+    const dim3 block(32 * NW, 1, 1);
+    fa_cuda_check(cudaEventRecord(d->fork, s), "fork record");
+    for (int q = 0; q < 3; ++q) {
+        fa_cuda_check(cudaStreamWaitEvent(d->mside[q], d->fork, 0), "fork wait");
+    }
+    fa_march_frame<NW, 1><<<ntop, block, 0, d->mside[0]>>>(m, p, mm, H);
+    fa_march_frame<NW, 2><<<nbot, block, 0, d->mside[1]>>>(m, p, mm, H);
+    if (nmid > 0) {
+        fa_march_frame<NW, 0><<<nmid, block, 0, d->mside[2]>>>(m, p, mm, H);
+    }
+    if (interior > 0) {
+        const dim3 grid(mm.t.bx_hi - mm.t.bx_lo + 1, mm.t.by_hi - mm.t.by_lo + 1, 1);
+        fa_march_fast<NW><<<grid, block, 0, s>>>(m, p, mm.t, H);
+    }
+    for (int q = 0; q < 3; ++q) {
+        fa_cuda_check(cudaEventRecord(d->mjoin[q], d->mside[q]), "join record");
+        fa_cuda_check(cudaStreamWaitEvent(s, d->mjoin[q], 0), "join wait");
+    }
+}
+
 // Launch one timestep.  Only the "pair" variant alternates base buffers by
 // parity; the others always update d->base in place.
 static void fa_launch_step(const fa_options_t *opt, fa_device_t *d, int parity,
@@ -2160,14 +2834,31 @@ static void fa_launch_step(const fa_options_t *opt, fa_device_t *d, int parity,
         default: fa_die("unsupported pair --tile-x/--tile-y/--block combination");
         }
         break;
+    case FA_KERNEL_MARCH:
+        switch (opt->block_x) {
+        case 64: fa_launch_march<2>(cfg, d, parity, (int)opt->tile_y, s); break;
+        case 96: fa_launch_march<3>(cfg, d, parity, (int)opt->tile_y, s); break;
+        case 128: fa_launch_march<4>(cfg, d, parity, (int)opt->tile_y, s); break;
+        default: fa_die("unsupported march --block (64, 96 or 128)");
+        }
+        break;
     default:
         fa_die("unsupported kernel variant");
     }
 }
 
-static void fa_upload_state(const fa_fields_t *fields, fa_device_t *d)
+static void fa_upload_state(const fa_config_t *cfg, const fa_fields_t *fields,
+    fa_device_t *d)
 {
     const size_t sb = fields->scalar_len * sizeof(float);
+    if (d->m.alloc[0]) {
+        const size_t row = ((size_t)cfg->nx + 2) * sizeof(float);
+        for (int k = 0; k < 2; ++k) {
+            fa_cuda_check(cudaMemcpy2D(d->m.base[k], (size_t)d->m.ps * sizeof(float),
+                fields->base, row, row, (size_t)cfg->ny + 2, cudaMemcpyHostToDevice),
+                "upload padded base");
+        }
+    }
     fa_cuda_check(cudaMemcpy(d->base, fields->base, sb, cudaMemcpyHostToDevice), "upload base");
     if (d->base_alt) {
         fa_cuda_check(cudaMemcpy(d->base_alt, fields->base, sb, cudaMemcpyHostToDevice),
@@ -2182,13 +2873,14 @@ static void fa_upload_state(const fa_fields_t *fields, fa_device_t *d)
 // variant where --block/--tile-x/--tile-y were not given.  "auto" selects
 // "regyf" while the six full-size fields of the per-stage scheme (base, two
 // stage buffers, accumulator, both velocities) fit in the L2 cache, and
-// "pair" (half the global traffic per step) once they do not.
+// "march" (one fused kernel per timestep, about a fifth of the global traffic
+// of "pair") once they do not.
 static void fa_resolve_kernel(fa_options_t *opt, size_t scalar_bytes)
 {
     if (opt->kernel == FA_KERNEL_AUTO) {
         int l2 = 0;
         fa_cuda_check(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, 0), "L2 size");
-        opt->kernel = 6 * scalar_bytes <= (size_t)l2 ? FA_KERNEL_REGYF : FA_KERNEL_PAIR;
+        opt->kernel = 6 * scalar_bytes <= (size_t)l2 ? FA_KERNEL_REGYF : FA_KERNEL_MARCH;
     }
     uint32_t bx = 32, by = 8, tx = 32, ty = 16;
     switch (opt->kernel) {
@@ -2196,6 +2888,7 @@ static void fa_resolve_kernel(fa_options_t *opt, size_t scalar_bytes)
     case FA_KERNEL_REGY:
     case FA_KERNEL_REGYF: ty = 24; break;
     case FA_KERNEL_PAIR: by = 6; tx = 58; ty = 12; break;
+    case FA_KERNEL_MARCH: bx = 128; by = 1; tx = 230; ty = 64; break;
     default: break;
     }
     if (!opt->block_supplied) {
@@ -2207,6 +2900,25 @@ static void fa_resolve_kernel(fa_options_t *opt, size_t scalar_bytes)
     }
     if (opt->tile_y == 0) {
         opt->tile_y = ty;
+    }
+    if (opt->kernel == FA_KERNEL_MARCH) {
+        if (opt->block_x != 64 && opt->block_x != 96 && opt->block_x != 128) {
+            fa_die("march supports --block 64, 96 or 128");
+        }
+        if (opt->tile_y % FA_M_R != 0 || opt->tile_y < 24) {
+            fa_die("march requires --tile-y a multiple of 8, at least 24");
+        }
+        opt->block_y = 1;
+        opt->tile_x = 2 * opt->block_x - 26;
+        if (opt->cfg.ny < opt->tile_y + 12) {
+            // A segment would hold the dependency cones of both y boundaries.
+            fprintf(stderr, "[march] ny < tile-y + 12: using regyf\n");
+            opt->kernel = FA_KERNEL_REGYF;
+            opt->block_x = 32;
+            opt->block_y = 8;
+            opt->tile_x = 32;
+            opt->tile_y = 24;
+        }
     }
     if ((uint64_t)opt->block_x * opt->block_y > 1024) {
         fa_die("block exceeds 1024 threads");
@@ -2246,11 +2958,44 @@ static void fa_run_cuda(const fa_options_t *opt, fa_fields_t *fields,
     }
     fa_cuda_check(cudaMemcpy(d.vx, fields->vx, xb, cudaMemcpyHostToDevice), "upload vx");
     fa_cuda_check(cudaMemcpy(d.vy, fields->vy, yb, cudaMemcpyHostToDevice), "upload vy");
-    fa_upload_state(fields, &d);
+    if (opt->kernel == FA_KERNEL_MARCH) {
+        const size_t nx = opt->cfg.nx;
+        const size_t ny = opt->cfg.ny;
+        const size_t pad = FA_M_PAD;
+        d.m.ps = (int)((nx + 2 + 2 * pad + 31) / 32 * 32);
+        d.m.pf = (int)((nx + 1 + 2 * pad + 31) / 32 * 32);
+        const size_t rows = ny + 2 + 2 * pad;
+        const size_t bytes[4] = {(size_t)d.m.ps * rows * sizeof(float),
+            (size_t)d.m.ps * rows * sizeof(float), (size_t)d.m.pf * rows * sizeof(float),
+            (size_t)d.m.ps * rows * sizeof(float)};
+        for (int k = 0; k < 4; ++k) {
+            fa_cuda_check(cudaMalloc((void **)&d.m.alloc[k], bytes[k]), "malloc padded");
+            fa_cuda_check(cudaMemset(d.m.alloc[k], 0, bytes[k]), "memset padded");
+        }
+        const size_t origin = pad + (size_t)d.m.ps * pad;
+        d.m.base[0] = d.m.alloc[0] + origin;
+        d.m.base[1] = d.m.alloc[1] + origin;
+        d.m.vx = d.m.alloc[2] + pad + (size_t)d.m.pf * pad;
+        d.m.vy = d.m.alloc[3] + origin;
+        fa_cuda_check(cudaMemcpy2D(d.m.vx, (size_t)d.m.pf * sizeof(float), fields->vx,
+            (nx + 1) * sizeof(float), (nx + 1) * sizeof(float), ny + 2,
+            cudaMemcpyHostToDevice), "upload padded vx");
+        fa_cuda_check(cudaMemcpy2D(d.m.vy, (size_t)d.m.ps * sizeof(float), fields->vy,
+            (nx + 2) * sizeof(float), (nx + 2) * sizeof(float), ny + 1,
+            cudaMemcpyHostToDevice), "upload padded vy");
+    }
+    fa_upload_state(&opt->cfg, fields, &d);
+    d.march_parts = (int)opt->frame_parts;
 
     cudaStream_t stream;
     fa_cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
     fa_cuda_check(cudaStreamCreateWithFlags(&d.side, cudaStreamNonBlocking), "side stream");
+    for (int q = 0; q < 3; ++q) {
+        fa_cuda_check(cudaStreamCreateWithFlags(&d.mside[q], cudaStreamNonBlocking),
+            "side stream");
+        fa_cuda_check(cudaEventCreateWithFlags(&d.mjoin[q], cudaEventDisableTiming),
+            "join event");
+    }
     fa_cuda_check(cudaEventCreateWithFlags(&d.fork, cudaEventDisableTiming), "fork event");
     fa_cuda_check(cudaEventCreateWithFlags(&d.join, cudaEventDisableTiming), "join event");
     cudaEvent_t ev_start, ev_end;
@@ -2282,7 +3027,7 @@ static void fa_run_cuda(const fa_options_t *opt, fa_fields_t *fields,
     }
     fa_cuda_check(cudaGetLastError(), "warmup launch");
     fa_cuda_check(cudaStreamSynchronize(stream), "warmup");
-    fa_upload_state(fields, &d);
+    fa_upload_state(&opt->cfg, fields, &d);
     fa_cuda_check(cudaDeviceSynchronize(), "restore");
     stats->init_seconds = fa_now_seconds() - init_start;
 
@@ -2299,8 +3044,15 @@ static void fa_run_cuda(const fa_options_t *opt, fa_fields_t *fields,
     fa_cuda_check(cudaGetLastError(), "solve launch");
     fa_cuda_check(cudaEventRecord(ev_end, stream), "record end");
     const float *final_base = (d.base_alt && (opt->cfg.steps & 1u)) ? d.base_alt : d.base;
-    fa_cuda_check(cudaMemcpyAsync(fields->base, final_base, sb, cudaMemcpyDeviceToHost,
-        stream), "download base");
+    if (opt->kernel == FA_KERNEL_MARCH) {
+        const size_t row = ((size_t)opt->cfg.nx + 2) * sizeof(float);
+        fa_cuda_check(cudaMemcpy2DAsync(fields->base, row, d.m.base[opt->cfg.steps & 1u],
+            (size_t)d.m.ps * sizeof(float), row, (size_t)opt->cfg.ny + 2,
+            cudaMemcpyDeviceToHost, stream), "download base");
+    } else {
+        fa_cuda_check(cudaMemcpyAsync(fields->base, final_base, sb, cudaMemcpyDeviceToHost,
+            stream), "download base");
+    }
     fa_cuda_check(cudaStreamSynchronize(stream), "solve");
     stats->solve_seconds = fa_now_seconds() - solve_start;
     float busy_ms = 0.0f;
@@ -2318,10 +3070,17 @@ static void fa_run_cuda(const fa_options_t *opt, fa_fields_t *fields,
     cudaEventDestroy(ev_end);
     cudaStreamDestroy(stream);
     cudaStreamDestroy(d.side);
+    for (int q = 0; q < 3; ++q) {
+        cudaStreamDestroy(d.mside[q]);
+        cudaEventDestroy(d.mjoin[q]);
+    }
     cudaEventDestroy(d.fork);
     cudaEventDestroy(d.join);
     cudaFree(d.base);
     cudaFree(d.base_alt);
+    for (int k = 0; k < 4; ++k) {
+        cudaFree(d.m.alloc[k]);
+    }
     cudaFree(d.stage[0]);
     cudaFree(d.stage[1]);
     cudaFree(d.accum);
@@ -2342,8 +3101,8 @@ static void fa_usage(const char *argv0)
     fprintf(stderr,
         "usage: %s [--mode cpu|cuda] [--cells nx,ny] [--steps n] [--dt dt]\n"
         "          [--input path] [--output path] [--dump [path]] [--dump-bin [path]]\n"
-        "          [--kernel auto|split|fused|tiled|prefetch|regy|regyf|pair] [--block x[,y]]\n"
-        "          [--tile-x n] [--tile-y n] [--graph on|off]\n",
+        "          [--kernel auto|split|fused|tiled|prefetch|regy|regyf|pair|march] [--block x[,y]]\n"
+        "          [--tile-x n] [--tile-y n] [--frame-parts n] [--graph on|off]\n",
         argv0);
 }
 
@@ -2386,6 +3145,7 @@ int main(int argc, char **argv)
     opt.graph = true;
     opt.tile_x = 0;
     opt.tile_y = 0;
+    opt.frame_parts = 2;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -2443,6 +3203,11 @@ int main(int argc, char **argv)
             opt.block_supplied = true;
         } else if (strcmp(argv[i], "--tile-x") == 0 && i + 1 < argc) {
             opt.tile_x = fa_parse_u32_strict(argv[++i], "--tile-x");
+        } else if (strcmp(argv[i], "--frame-parts") == 0 && i + 1 < argc) {
+            opt.frame_parts = fa_parse_u32_strict(argv[++i], "--frame-parts");
+            if (opt.frame_parts < 1 || opt.frame_parts > 8) {
+                fa_die("--frame-parts must be 1..8");
+            }
         } else if (strcmp(argv[i], "--tile-y") == 0 && i + 1 < argc) {
             opt.tile_y = fa_parse_u32_strict(argv[++i], "--tile-y");
         } else if (strcmp(argv[i], "--graph") == 0 && i + 1 < argc) {

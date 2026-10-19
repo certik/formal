@@ -50,8 +50,9 @@ Options (same conventions as the Metal reference):
 | `--cells nx,ny`, `--steps n`, `--dt dt` | analytic Gaussian input instead (default `dt = 1e-4 * min(51/nx, 51/ny)^2`) |
 | `--dump-bin [path]` | final scalar, headerless column-major FP32 `(nx+2, ny+2)` |
 | `--dump [path]`, `--output path` | final scalar as CSV |
-| `--kernel <variant>` | `auto` (default), `split`, `fused`, `tiled`, `prefetch`, `regy`, `regyf`, `pair`; see [PERFORMANCE.md](./PERFORMANCE.md) |
+| `--kernel <variant>` | `auto` (default), `split`, `fused`, `tiled`, `prefetch`, `regy`, `regyf`, `pair`, `march`; see [PERFORMANCE.md](./PERFORMANCE.md) |
 | `--block x,y`, `--tile-x n`, `--tile-y n` | launch geometry (each variant has tuned defaults) |
+| `--frame-parts n` | `march`: split boundary tiles into n row parts (default 2) |
 | `--graph on\|off` | launch each timestep as a CUDA Graph (default on) |
 
 The output line `RESULT mode=... solve_wall=... gpu_busy=...` reports the
@@ -59,7 +60,9 @@ solve-region wall time (all timesteps plus the final device-to-host copy of
 the scalar; excluding initialization, upload, the untimed warm-up step and
 file I/O) and the CUDA-event time of the timestep loop.  `--kernel auto`
 selects `regyf` when the six full-size fields of the per-stage scheme fit in
-the L2 cache and `pair` otherwise; the chosen variant is printed.
+the L2 cache and `march` (one fused kernel per timestep) otherwise; the
+chosen variant is printed.  `march` needs `ny >= tile-y + 12` and falls back
+to `regyf` on smaller grids.
 
 ## Validation
 
