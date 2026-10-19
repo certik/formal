@@ -2137,6 +2137,10 @@ static void fa_launch_step(const fa_options_t *opt, fa_device_t *d, int parity,
         case 8024: fa_launch_regy<24, 8>(cfg, d, sp, s); break;
         case 6024: fa_launch_regy<24, 6>(cfg, d, sp, s); break;
         case 12012: fa_launch_regy<12, 12>(cfg, d, sp, s); break;
+        case 8048: fa_launch_regy<48, 8>(cfg, d, sp, s); break;
+        case 4024: fa_launch_regy<24, 4>(cfg, d, sp, s); break;
+        case 16048: fa_launch_regy<48, 16>(cfg, d, sp, s); break;
+        case 8040: fa_launch_regy<40, 8>(cfg, d, sp, s); break;
         default: fa_die("unsupported regy --block/--tile-y combination");
         }
         break;
