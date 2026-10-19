@@ -83,10 +83,10 @@ validated (see [Validation](#validation)).  Solve-wall medians of 5 runs:
 | `pair` | 0.0774 | 0.1786 | 0.6745 | two RK stages per kernel with halo recomputation; stage-1/3 fields never leave the chip; half the DRAM traffic per step |
 | `march` | 0.0977 | 0.1209 | **0.3590** | one kernel per timestep (all four stages): blocks march down column strips with a register pipeline in y; only base and the velocities are read and base written per step (see below) |
 | `lean` | 0.0399 | 0.0866 | 1.1984 | one kernel per stage with the `march` thread layout and padded fields: every field read once (plus a 3-row halo of the stage input), boundary rim in a concurrent kernel overlapped by programmatic dependent launch (see below) |
-| `lean2` | **0.0322** | **0.0682** | 0.6320 | `lean` with two stages per kernel (1+2, 3+4): the stage-1/3 values, rates and accumulator stay on chip, about 11 instead of 26 field accesses per step (see below) |
-| `auto` (default) | 0.0322 | 0.0682 | 0.3590 | `lean2` if 6 fields fit in L2, else `march` |
+| `lean2` | **0.0302** | **0.0635** | 0.6320 | `lean` with two stages per kernel (1+2, 3+4): the stage-1/3 values, rates and accumulator stay on chip, about 11 instead of 26 field accesses per step (see below) |
+| `auto` (default) | 0.0302 | 0.0635 | 0.3590 | `lean2` if 6 fields fit in L2, else `march` |
 
-Speed-up of the default over LFortran Formal: **8.3x at 2048²** and 2.9x at
+Speed-up of the default over LFortran Formal: **8.9x at 2048²** and 3.1x at
 1024².  CUDA Graphs (one graph per timestep) made no measurable difference
 (`split` 0.5583 vs 0.5590 s, `fused` 0.2083 vs 0.2095 s, graph off vs on):
 launches are asynchronous and there is no host synchronization inside the
@@ -203,9 +203,13 @@ traffic (`lean` 510 MB, `regyf` 619 MB), 46 M warp instructions, 34 MB DRAM
 write-back; 0.0682 s for 1000 steps (`lean` 0.0892 s, interleaved, 5 runs
 each).  166-168 registers; the strip kernel issues on ~37% of the cycles
 and runs L2 at ~4.5 TB/s, so it is neither purely bandwidth nor purely
-latency bound.  Sweeps (block threads / rows per segment, s): 2048² 64/64
-0.0696, 96/32 0.0715, 128/64 0.0716, 64/72 0.0730, 64/40 0.0735; 1024²
-64/24 0.0325, 64/16 0.0346, 96/32 0.0347.
+latency bound.  The second stage takes the velocities and base of its rows
+from registers (three rows carried from the previous chunk, the rest from
+the first stage's loads) instead of reloading them, which the L1 did not
+catch: 2048² 0.0703 → 0.0635 s, 1024² 0.0323 → 0.0302 s (interleaved),
+same register count.  Sweeps (block threads / rows per segment, s): 2048²
+64/64 0.0637, 128/64 0.0641, 64/32 0.0668, 96/32 0.0678, 64/80 0.0693;
+1024² 64/24 0.0305, 96/24 0.0306, 64/32 0.0325.
 
 Rejected experiments (in commit `d353184`): a shared-memory-free "stream"
 kernel (warps walking 26-column strips with shuffles in x and a register

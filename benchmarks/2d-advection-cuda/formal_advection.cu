@@ -3351,6 +3351,8 @@ fa_lpair(fa_lptr_t m, fa_step_params_t p, int col_lo, int col_hi, int row_lo, in
     float ra[2][3], ydA[2][3], yaA[2][3];      // stage-A carries (rows, faces)
     float rb[2][3], ydB[2][3], yaB[2][3];      // stage-B carries
     float kc[2][3];                             // aux (k1 or acc3) rows carried
+    float2 cvy[3], cvx[3], cbs[3];              // stage-B velocities and base
+                                                // of the 3 rows before bA
     {
         constexpr int RR = 6;
         float w[2][RR + 6];                    // input rows [y0-6, y0+6)
@@ -3401,6 +3403,12 @@ fa_lpair(fa_lptr_t m, fa_step_params_t p, int col_lo, int col_hi, int row_lo, in
         // stage-A values on rows [y0-3, y0+3)
         float u[2][RR], aux[2][RR];
 #pragma unroll
+        for (int q = 0; q < 3; ++q) {
+            cvy[q] = vyl[3 + q];
+            cvx[q] = vxl[3 + q];
+            cbs[q] = fa_ld2(m.base + c + ps * (y0 + q));
+        }
+#pragma unroll
         for (int r = 0; r < RR; ++r) {
             const float2 bj = fa_ld2(m.base + c + ps * (y0 - 3 + r));
             const float2 aj = PAIR == 1 ? fa_ld2(m.acc + c + ps * (y0 - 3 + r)) :
@@ -3434,13 +3442,27 @@ fa_lpair(fa_lptr_t m, fa_step_params_t p, int col_lo, int col_hi, int row_lo, in
         const int bA = y0 + 3 + k * R;
         const int bB = bA - 3;
         float uA[2][R], auxA[2][R];
+        float2 vyB[R], vxB[R], bsB[R];          // stage-B inputs (rows bB + q)
         {
-            float2 cur[R], vyl[R], vxl[R];
+            float2 cur[R], vyl[R], vxl[R], bsl[R];
 #pragma unroll
             for (int q = 0; q < R; ++q) {
                 cur[q] = fa_ld2(m.in + c + ps * (bA + 3 + q));
                 vyl[q] = fa_ld2(m.vy + c + ps * (bA + 1 + q));
                 vxl[q] = fa_ld2(m.vx + c + pf * (bA + q));
+                bsl[q] = fa_ld2(m.base + c + ps * (bA + q));
+            }
+#pragma unroll
+            for (int q = 0; q < R; ++q) {
+                vyB[q] = q < 3 ? cvy[q] : vyl[q - 3];
+                vxB[q] = q < 3 ? cvx[q] : vxl[q - 3];
+                bsB[q] = q < 3 ? cbs[q] : bsl[q - 3];
+            }
+#pragma unroll
+            for (int q = 0; q < 3; ++q) {
+                cvy[q] = vyl[R - 3 + q];
+                cvx[q] = vxl[R - 3 + q];
+                cbs[q] = bsl[R - 3 + q];
             }
             float w[2][R + 6];
             float yd[2][R + 3], ya[2][R + 3];
@@ -3471,7 +3493,7 @@ fa_lpair(fa_lptr_t m, fa_step_params_t p, int col_lo, int col_hi, int row_lo, in
             }
 #pragma unroll
             for (int r = 0; r < R; ++r) {
-                const float2 bj = fa_ld2(m.base + c + ps * (bA + r));
+                const float2 bj = bsl[r];
                 const float2 aj = PAIR == 1 ? fa_ld2(m.acc + c + ps * (bA + r)) :
                     make_float2(0.0f, 0.0f);
 #pragma unroll
@@ -3483,12 +3505,6 @@ fa_lpair(fa_lptr_t m, fa_step_params_t p, int col_lo, int col_hi, int row_lo, in
         }
         // stage B
         {
-            float2 vyl[R], vxl[R];
-#pragma unroll
-            for (int q = 0; q < R; ++q) {
-                vyl[q] = fa_ld2(m.vy + c + ps * (bB + 1 + q));
-                vxl[q] = fa_ld2(m.vx + c + pf * (bB + q));
-            }
             float w[2][R + 6];
             float yd[2][R + 3], ya[2][R + 3];
             float ax[2][R];
@@ -3517,7 +3533,7 @@ fa_lpair(fa_lptr_t m, fa_step_params_t p, int col_lo, int col_hi, int row_lo, in
                 }
             }
             float rhs[2][R];
-            fa_lp_rhs<NW, R>(t, p, w, yd, ya, vyl, vxl, xb, fd, fa, rhs);
+            fa_lp_rhs<NW, R>(t, p, w, yd, ya, vyB, vxB, xb, fd, fa, rhs);
 #pragma unroll
             for (int e = 0; e < 2; ++e) {
 #pragma unroll
@@ -3529,7 +3545,7 @@ fa_lpair(fa_lptr_t m, fa_step_params_t p, int col_lo, int col_hi, int row_lo, in
 #pragma unroll
             for (int r = 0; r < R; ++r) {
                 const int j = bB + r;
-                const float2 bj = fa_ld2(m.base + c + ps * j);
+                const float2 bj = bsB[r];
                 float o[2], na[2];
 #pragma unroll
                 for (int e = 0; e < 2; ++e) {
