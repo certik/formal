@@ -62,9 +62,8 @@ typedef enum {
     FA_KERNEL_PREFETCH,
     FA_KERNEL_REGY,
     FA_KERNEL_REGYF,
-    FA_KERNEL_STREAM,
-    FA_KERNEL_STEP,
     FA_KERNEL_PAIR,
+    FA_KERNEL_AUTO,
     FA_KERNEL_COUNT_
 } fa_kernel_t;
 
@@ -75,9 +74,8 @@ static const char *FA_KERNEL_NAMES[FA_KERNEL_COUNT_] = {
     "prefetch",
     "regy",
     "regyf",
-    "stream",
-    "step",
     "pair",
+    "auto",
 };
 
 typedef struct {
@@ -1373,6 +1371,30 @@ static void fa_launch_tiled(const fa_config_t *cfg, fa_device_t *d, cudaStream_t
         d->accum, d->vx, d->vy, p4);
 }
 
+// x and y parts of the divergence at one cell from the general operator
+// rows, on any line accessor (used for cells next to a boundary).
+template <class L>
+__device__ __forceinline__ void fa_xpart(const L &row, const float *__restrict__ vxr,
+    int nx, int c, float inv_dx, float &diffx, float &advx)
+{
+    const int sx = nx + 2;
+    const auto dface = [&](int f) { return 0.5f * fa_t_grad(row, sx, f, inv_dx); };
+    const auto aface = [&](int f) { return __ldg(vxr + f) * fa_t_interp(row, sx, f); };
+    diffx = fa_t_div(dface, nx + 1, c - 1, inv_dx);
+    advx = fa_t_div(aface, nx + 1, c - 1, inv_dx);
+}
+
+template <class L>
+__device__ __forceinline__ void fa_ypart(const L &col, const float *__restrict__ vyc,
+    int sx, int ny, int j, float inv_dy, float &diffy, float &advy)
+{
+    const int sy = ny + 2;
+    const auto dface = [&](int g) { return 0.5f * fa_t_grad(col, sy, g, inv_dy); };
+    const auto aface = [&](int g) { return __ldg(vyc + sx * g) * fa_t_interp(col, sy, g); };
+    diffy = fa_t_div(dface, ny + 1, j - 1, inv_dy);
+    advy = fa_t_div(aface, ny + 1, j - 1, inv_dy);
+}
+
 // Interior/frame split ("regyf", "pair"): tiles are split into an interior
 // rectangle [bx_lo, bx_hi] x [by_lo, by_hi] (no boundary handling compiled
 // in, BND = false) and the surrounding frame (BND = true), launched as two
@@ -1697,197 +1719,7 @@ static void fa_launch_regy(const fa_config_t *cfg, fa_device_t *d, bool split,
     fa_launch_regy_stage<TY, BY, 4>(cfg, d, split, d->stage[0], NULL, s);
 }
 
-// Variant "stream": no shared memory and no barriers.  Each warp owns 26
-// consecutive cell columns and walks a strip of TYS rows.  Lane L holds
-// scalar column g = i0 - 3 + L, so all x-direction neighbours of the 26 cell
-// lanes (L = 3..28) are reachable with warp shuffles:
-//   x face g    = f(s[g-1], s[g], s[g+1], s[g+2])   (shuffles of the row)
-//   x div at g  = f(face[g-2], face[g-1], face[g], face[g+1])
-// The y direction is a register pipeline along the strip: four scalar rows
-// and four y faces (diffusive and advective) are kept per lane, so each new
-// row costs one scalar load, one y-face evaluation and one divergence.
-// Cells whose x (or y) stencil uses a one-sided boundary row take that part
-// of the RHS from the general operator rows, read directly from global
-// memory; the x and y parts are then combined in the oracle's order.
-struct fa_gline_t {
-    const float *p;
-    int stride;
-    __device__ __forceinline__ float operator()(int k) const
-    {
-        return __ldg(p + k * stride);
-    }
-};
-
-__device__ __forceinline__ void fa_general_xpart(const float *__restrict__ stage_in,
-    const float *__restrict__ vx, int nx, int g, int j, float inv_dx, float &diffx,
-    float &advx)
-{
-    const int sx = nx + 2;
-    const fa_gline_t row = {stage_in + sx * j, 1};
-    const float *vxr = vx + (nx + 1) * j;
-    const auto dface = [&](int f) { return 0.5f * fa_t_grad(row, sx, f, inv_dx); };
-    const auto aface = [&](int f) { return __ldg(vxr + f) * fa_t_interp(row, sx, f); };
-    diffx = fa_t_div(dface, nx + 1, g - 1, inv_dx);
-    advx = fa_t_div(aface, nx + 1, g - 1, inv_dx);
-}
-
-__device__ __forceinline__ void fa_general_ypart(const float *__restrict__ stage_in,
-    const float *__restrict__ vy, int nx, int ny, int g, int j, float inv_dy,
-    float &diffy, float &advy)
-{
-    const int sx = nx + 2;
-    const int sy = ny + 2;
-    const fa_gline_t col = {stage_in + g, sx};
-    const float *vyc = vy + g;
-    const auto dface = [&](int f) { return 0.5f * fa_t_grad(col, sy, f, inv_dy); };
-    const auto aface = [&](int f) { return __ldg(vyc + sx * f) * fa_t_interp(col, sy, f); };
-    diffy = fa_t_div(dface, ny + 1, j - 1, inv_dy);
-    advy = fa_t_div(aface, ny + 1, j - 1, inv_dy);
-}
-
-template <int TYS, int STAGE>
-__global__ void __launch_bounds__(128)
-fa_stream_stage(const float *__restrict__ stage_in, float *base,
-    float *__restrict__ stage_out, float *__restrict__ accum,
-    const float *__restrict__ vx, const float *__restrict__ vy, fa_stage_params_t p,
-    int warps_x)
-{
-    constexpr int CW = 26;               // cell columns per warp
-    const int nx = p.nx;
-    const int ny = p.ny;
-    const int sx = nx + 2;
-    const int lane = threadIdx.x & 31;
-    const int gw = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
-    const int wx = gw % warps_x;
-    const int strip = gw / warps_x;
-    const int j0 = 1 + strip * TYS;
-    if (j0 > ny) {
-        return;
-    }
-    const int j1 = min(j0 + TYS, ny + 1);
-    const int i0 = 1 + wx * CW;
-    const int g = i0 - 3 + lane;                     // this lane's column
-    const int gl = min(max(g, 0), nx + 1);           // clamped for loads
-    const int gf = min(max(g, 0), nx);               // clamped x-face index
-    const bool cell = lane >= 3 && lane < 3 + CW && g <= nx;
-    const bool x_interior = g >= 4 && g <= nx - 3;
-    const float inv_dx = p.inv_dx;
-    const float inv_dy = p.inv_dy;
-    const float *col = stage_in + gl;
-    const float *vyc = vy + gl;
-    const float *vxc = vx + gf;
-
-    // Scalar rows r0..r3 = rows j..j+3; y faces q0..q3 = faces j-2..j+1.
-    const auto row_ld = [&](int j) { return __ldg(col + sx * min(max(j, 0), ny + 1)); };
-    const auto yface = [&](int f, float a, float b, float c, float d, float &dif,
-                           float &adv) {
-        dif = 0.5f * fa_grad_interior(a, b, c, d, inv_dy);
-        adv = __ldg(vyc + sx * min(max(f, 0), ny)) * fa_interp_interior(a, b, c, d);
-    };
-    float sm3 = row_ld(j0 - 3), sm2 = row_ld(j0 - 2), sm1 = row_ld(j0 - 1);
-    float r0 = row_ld(j0), r1 = row_ld(j0 + 1), r2 = row_ld(j0 + 2);
-    float dq0, aq0, dq1, aq1, dq2, aq2, dq3, aq3;
-    yface(j0 - 2, sm3, sm2, sm1, r0, dq0, aq0);
-    yface(j0 - 1, sm2, sm1, r0, r1, dq1, aq1);
-    yface(j0, sm1, r0, r1, r2, dq2, aq2);
-
-#pragma unroll 4
-    for (int j = j0; j < j1; ++j) {
-        const float r3 = row_ld(j + 3);
-        const int idx = gl + sx * j;
-        float b = 0.0f, a = 0.0f;
-        if (cell) {
-            b = base[idx];
-            if (STAGE != 1) {
-                a = accum[idx];
-            }
-        }
-        const float vxj = __ldg(vxc + (nx + 1) * j);
-        yface(j + 1, r0, r1, r2, r3, dq3, aq3);
-
-        // x direction on row j: face g from scalars g-1..g+2.
-        const float sl1 = __shfl_up_sync(0xffffffffu, r0, 1);
-        const float sr1 = __shfl_down_sync(0xffffffffu, r0, 1);
-        const float sr2 = __shfl_down_sync(0xffffffffu, r0, 2);
-        const float dxf = 0.5f * fa_grad_interior(sl1, r0, sr1, sr2, inv_dx);
-        const float axf = vxj * fa_interp_interior(sl1, r0, sr1, sr2);
-        const float dxm2 = __shfl_up_sync(0xffffffffu, dxf, 2);
-        const float dxm1 = __shfl_up_sync(0xffffffffu, dxf, 1);
-        const float dxp1 = __shfl_down_sync(0xffffffffu, dxf, 1);
-        const float axm2 = __shfl_up_sync(0xffffffffu, axf, 2);
-        const float axm1 = __shfl_up_sync(0xffffffffu, axf, 1);
-        const float axp1 = __shfl_down_sync(0xffffffffu, axf, 1);
-
-        if (cell) {
-            float diffx, advx, diffy, advy;
-            if (x_interior) {
-                diffx = fa_div_interior(dxm2, dxm1, dxf, dxp1, inv_dx);
-                advx = fa_div_interior(axm2, axm1, axf, axp1, inv_dx);
-            } else {
-                fa_general_xpart(stage_in, vx, nx, g, j, inv_dx, diffx, advx);
-            }
-            if (j >= 4 && j <= ny - 3) {
-                diffy = fa_div_interior(dq0, dq1, dq2, dq3, inv_dy);
-                advy = fa_div_interior(aq0, aq1, aq2, aq3, inv_dy);
-            } else {
-                fa_general_ypart(stage_in, vy, nx, ny, g, j, inv_dy, diffy, advy);
-            }
-            const float rhs = (diffx + diffy) - (advx + advy);
-            if (STAGE == 1) {
-                accum[idx] = rhs;
-                stage_out[idx] = b + p.alpha * rhs;
-            } else if (STAGE == 2 || STAGE == 3) {
-                accum[idx] = a + p.weight * rhs;
-                stage_out[idx] = b + p.alpha * rhs;
-            } else {
-                base[idx] = b + p.dt_over_6 * (a + rhs);
-            }
-        }
-        r0 = r1;
-        r1 = r2;
-        r2 = r3;
-        dq0 = dq1;
-        dq1 = dq2;
-        dq2 = dq3;
-        aq0 = aq1;
-        aq1 = aq2;
-        aq2 = aq3;
-    }
-}
-
-template <int TYS>
-static void fa_launch_stream(const fa_config_t *cfg, fa_device_t *d, cudaStream_t s)
-{
-    const int warps_x = (int)((cfg->nx + 25) / 26);
-    const int strips = (int)((cfg->ny + TYS - 1) / TYS);
-    const int warps = warps_x * strips;
-    const dim3 block(128, 1, 1);
-    const dim3 grid((warps + 3) / 4, 1, 1);
-    const fa_stage_params_t p1 = fa_stage_params(cfg, 1);
-    const fa_stage_params_t p2 = fa_stage_params(cfg, 2);
-    const fa_stage_params_t p3 = fa_stage_params(cfg, 3);
-    const fa_stage_params_t p4 = fa_stage_params(cfg, 4);
-    fa_stream_stage<TYS, 1><<<grid, block, 0, s>>>(d->base, d->base, d->stage[0],
-        d->accum, d->vx, d->vy, p1, warps_x);
-    fa_stream_stage<TYS, 2><<<grid, block, 0, s>>>(d->stage[0], d->base, d->stage[1],
-        d->accum, d->vx, d->vy, p2, warps_x);
-    fa_stream_stage<TYS, 3><<<grid, block, 0, s>>>(d->stage[1], d->base, d->stage[0],
-        d->accum, d->vx, d->vy, p3, warps_x);
-    fa_stream_stage<TYS, 4><<<grid, block, 0, s>>>(d->stage[0], d->base, NULL,
-        d->accum, d->vx, d->vy, p4, warps_x);
-}
-
-// Variant "step": one kernel per RK4 timestep (temporal blocking).  A block
-// owns a TX x TY tile of cells and keeps a region extended by H = 12 points
-// (3 per stage, the interior stencil radius) in shared memory.  Each stage is
-// evaluated on a region that shrinks by 3 points per stage, so the tile's
-// stage-4 result needs only the step's input `base_in`; all stage values and
-// the RK accumulator stay on chip.  The last tile in each direction is
-// shifted inwards to end at the last cell (tiles overlap and write identical
-// values), so a tile always contains at least five cells from any interior
-// edge: the wider one-sided boundary rows then never read outside the valid
-// region.  `base_in` and `base_out` alternate between timesteps because
-// neighbouring blocks read the halo of `base_in`.
+// Parameters of the kernels that advance whole RK4 stage pairs.
 struct fa_step_params_t {
     int nx;
     int ny;
@@ -1897,169 +1729,6 @@ struct fa_step_params_t {
     float dt_half;
     float dt_over_6;
 };
-
-template <bool INTERIOR, class X>
-__device__ __forceinline__ float fa_cell_rhs(const X &row, const X &col,
-    const float *__restrict__ vx, const float *__restrict__ vy, int gi, int gj,
-    const fa_step_params_t &p)
-{
-    const int nx = p.nx;
-    const int ny = p.ny;
-    const int sx = nx + 2;
-    const int sy = ny + 2;
-    const float inv_dx = p.inv_dx;
-    const float inv_dy = p.inv_dy;
-    const float *vxr = vx + (nx + 1) * gj;
-    const float *vyc = vy + gi;
-    if (INTERIOR) {
-        float s[7], t[7];
-#pragma unroll
-        for (int k = 0; k < 7; ++k) {
-            s[k] = row(gi - 3 + k);
-            t[k] = col(gj - 3 + k);
-        }
-        float dxf[4], axf[4], dyf[4], ayf[4];
-#pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            // Face f = gi - 2 + k uses scalars f-1..f+2 = s[k..k+3].
-            dxf[k] = 0.5f * fa_grad_interior(s[k], s[k + 1], s[k + 2], s[k + 3], inv_dx);
-            axf[k] = __ldg(vxr + gi - 2 + k) *
-                fa_interp_interior(s[k], s[k + 1], s[k + 2], s[k + 3]);
-            dyf[k] = 0.5f * fa_grad_interior(t[k], t[k + 1], t[k + 2], t[k + 3], inv_dy);
-            ayf[k] = __ldg(vyc + sx * (gj - 2 + k)) *
-                fa_interp_interior(t[k], t[k + 1], t[k + 2], t[k + 3]);
-        }
-        const float diffx = fa_div_interior(dxf[0], dxf[1], dxf[2], dxf[3], inv_dx);
-        const float diffy = fa_div_interior(dyf[0], dyf[1], dyf[2], dyf[3], inv_dy);
-        const float advx = fa_div_interior(axf[0], axf[1], axf[2], axf[3], inv_dx);
-        const float advy = fa_div_interior(ayf[0], ayf[1], ayf[2], ayf[3], inv_dy);
-        return (diffx + diffy) - (advx + advy);
-    }
-    const auto dx_face = [&](int f) { return 0.5f * fa_t_grad(row, sx, f, inv_dx); };
-    const auto ax_face = [&](int f) { return __ldg(vxr + f) * fa_t_interp(row, sx, f); };
-    const auto dy_face = [&](int g) { return 0.5f * fa_t_grad(col, sy, g, inv_dy); };
-    const auto ay_face = [&](int g) {
-        return __ldg(vyc + sx * g) * fa_t_interp(col, sy, g);
-    };
-    const float diffx = fa_t_div(dx_face, nx + 1, gi - 1, inv_dx);
-    const float diffy = fa_t_div(dy_face, ny + 1, gj - 1, inv_dy);
-    const float advx = fa_t_div(ax_face, nx + 1, gi - 1, inv_dx);
-    const float advy = fa_t_div(ay_face, ny + 1, gj - 1, inv_dy);
-    return (diffx + diffy) - (advx + advy);
-}
-
-template <int TX, int TY, int BY>
-struct fa_step_shape_t {
-    static constexpr int H = 12;
-    static constexpr int EW = TX + 2 * H;
-    static constexpr int EH = TY + 2 * H;
-    static constexpr int SA = (EW + 31) / 32;   // slots per thread in x
-    static constexpr int SB = (EH + BY - 1) / BY;
-};
-
-template <int TX, int TY, int BY, bool INTERIOR>
-__device__ __forceinline__ void fa_step_body(const float *__restrict__ base_in,
-    float *__restrict__ base_out, const float *__restrict__ vx,
-    const float *__restrict__ vy, float (*sa)[fa_step_shape_t<TX, TY, BY>::EW],
-    float (*sb)[fa_step_shape_t<TX, TY, BY>::EW], int i0, int j0,
-    const fa_step_params_t &p)
-{
-    using S = fa_step_shape_t<TX, TY, BY>;
-    constexpr int H = S::H;
-    constexpr int EW = S::EW;
-    constexpr int EH = S::EH;
-    const int nx = p.nx;
-    const int ny = p.ny;
-    const int sx = nx + 2;
-    const int ex0 = i0 - H;
-    const int ey0 = j0 - H;
-    const int lane = threadIdx.x;
-    const int ty = threadIdx.y;
-
-    float b[S::SB][S::SA];
-    float acc[S::SB][S::SA];
-#pragma unroll
-    for (int q = 0; q < S::SB; ++q) {
-#pragma unroll
-        for (int r = 0; r < S::SA; ++r) {
-            const int lx = lane + 32 * r;
-            const int ly = ty + BY * q;
-            const int gi = ex0 + lx;
-            const int gj = ey0 + ly;
-            float v = 0.0f;
-            if (lx < EW && ly < EH && gi >= 0 && gi <= nx + 1 && gj >= 0 && gj <= ny + 1) {
-                v = base_in[gi + sx * gj];
-                sa[ly][lx] = v;
-                sb[ly][lx] = v;
-            }
-            b[q][r] = v;
-            acc[q][r] = 0.0f;
-        }
-    }
-    __syncthreads();
-
-#pragma unroll
-    for (int stage = 1; stage <= 4; ++stage) {
-        float (*in)[EW] = (stage & 1) ? sa : sb;
-        float (*out)[EW] = (stage & 1) ? sb : sa;
-        const int lo = 3 * stage;            // valid local range [lo, E - lo)
-#pragma unroll
-        for (int q = 0; q < S::SB; ++q) {
-#pragma unroll
-            for (int r = 0; r < S::SA; ++r) {
-                const int lx = lane + 32 * r;
-                const int ly = ty + BY * q;
-                const int gi = ex0 + lx;
-                const int gj = ey0 + ly;
-                if (lx < lo || lx >= EW - lo || ly < lo || ly >= EH - lo ||
-                    gi < 1 || gi > nx || gj < 1 || gj > ny) {
-                    continue;
-                }
-                const fa_sline_t row = {&in[ly][0], ex0, 1};
-                const fa_sline_t col = {&in[0][lx], ey0, EW};
-                const float rhs = fa_cell_rhs<INTERIOR>(row, col, vx, vy, gi, gj, p);
-                if (stage == 1) {
-                    acc[q][r] = rhs;
-                    out[ly][lx] = b[q][r] + p.dt_half * rhs;
-                } else if (stage == 2) {
-                    acc[q][r] = acc[q][r] + 2.0f * rhs;
-                    out[ly][lx] = b[q][r] + p.dt_half * rhs;
-                } else if (stage == 3) {
-                    acc[q][r] = acc[q][r] + 2.0f * rhs;
-                    out[ly][lx] = b[q][r] + p.dt * rhs;
-                } else {
-                    const float a = acc[q][r] + rhs;
-                    base_out[gi + sx * gj] = b[q][r] + p.dt_over_6 * a;
-                }
-            }
-        }
-        if (stage < 4) {
-            __syncthreads();
-        }
-    }
-}
-
-template <int TX, int TY, int BY>
-__global__ void __launch_bounds__(32 * BY)
-fa_step_kernel(const float *__restrict__ base_in, float *__restrict__ base_out,
-    const float *__restrict__ vx, const float *__restrict__ vy, fa_step_params_t p)
-{
-    using S = fa_step_shape_t<TX, TY, BY>;
-    __shared__ float sa[S::EH][S::EW];
-    __shared__ float sb[S::EH][S::EW];
-    const int i0 = min(1 + (int)blockIdx.x * TX, max(1, p.nx - TX + 1));
-    const int j0 = min(1 + (int)blockIdx.y * TY, max(1, p.ny - TY + 1));
-    // Interior block: every cell of the stage-1 region uses the interior
-    // divergence row and every face it touches the interior gradient and
-    // interpolation rows.
-    const bool interior = i0 - S::H + 3 >= 4 && i0 - S::H + S::EW - 4 <= p.nx - 3 &&
-                          j0 - S::H + 3 >= 4 && j0 - S::H + S::EH - 4 <= p.ny - 3;
-    if (interior) {
-        fa_step_body<TX, TY, BY, true>(base_in, base_out, vx, vy, sa, sb, i0, j0, p);
-    } else {
-        fa_step_body<TX, TY, BY, false>(base_in, base_out, vx, vy, sa, sb, i0, j0, p);
-    }
-}
 
 static fa_step_params_t fa_step_params(const fa_config_t *cfg)
 {
@@ -2072,42 +1741,6 @@ static fa_step_params_t fa_step_params(const fa_config_t *cfg)
     p.dt_half = 0.5f * cfg->dt;
     p.dt_over_6 = cfg->dt / 6.0f;
     return p;
-}
-
-template <int TX, int TY, int BY>
-static void fa_launch_step_kernel(const fa_config_t *cfg, fa_device_t *d, int parity,
-    cudaStream_t s)
-{
-    const dim3 block(32, BY, 1);
-    const dim3 grid((cfg->nx + TX - 1) / TX, (cfg->ny + TY - 1) / TY, 1);
-    const fa_step_params_t p = fa_step_params(cfg);
-    const float *in = parity ? d->base_alt : d->base;
-    float *out = parity ? d->base : d->base_alt;
-    fa_step_kernel<TX, TY, BY><<<grid, block, 0, s>>>(in, out, d->vx, d->vy, p);
-}
-
-// x and y parts of the divergence at one cell from the general operator
-// rows, on any line accessor (used for cells next to a boundary).
-template <class L>
-__device__ __forceinline__ void fa_xpart(const L &row, const float *__restrict__ vxr,
-    int nx, int c, float inv_dx, float &diffx, float &advx)
-{
-    const int sx = nx + 2;
-    const auto dface = [&](int f) { return 0.5f * fa_t_grad(row, sx, f, inv_dx); };
-    const auto aface = [&](int f) { return __ldg(vxr + f) * fa_t_interp(row, sx, f); };
-    diffx = fa_t_div(dface, nx + 1, c - 1, inv_dx);
-    advx = fa_t_div(aface, nx + 1, c - 1, inv_dx);
-}
-
-template <class L>
-__device__ __forceinline__ void fa_ypart(const L &col, const float *__restrict__ vyc,
-    int sx, int ny, int j, float inv_dy, float &diffy, float &advy)
-{
-    const int sy = ny + 2;
-    const auto dface = [&](int g) { return 0.5f * fa_t_grad(col, sy, g, inv_dy); };
-    const auto aface = [&](int g) { return __ldg(vyc + sx * g) * fa_t_interp(col, sy, g); };
-    diffy = fa_t_div(dface, ny + 1, j - 1, inv_dy);
-    advy = fa_t_div(aface, ny + 1, j - 1, inv_dy);
 }
 
 // Variant "pair": two RK stages per kernel (stages 1+2, then 3+4), so the
@@ -2434,7 +2067,7 @@ static void fa_launch_pair(const fa_config_t *cfg, fa_device_t *d, int parity,
     }
 }
 
-// Launch one timestep.  Only the "step" variant alternates base buffers by
+// Launch one timestep.  Only the "pair" variant alternates base buffers by
 // parity; the others always update d->base in place.
 static void fa_launch_step(const fa_options_t *opt, fa_device_t *d, int parity,
     cudaStream_t s)
@@ -2508,16 +2141,6 @@ static void fa_launch_step(const fa_options_t *opt, fa_device_t *d, int parity,
         }
         break;
     }
-    case FA_KERNEL_STREAM:
-        switch (opt->tile_y) {
-        case 8: fa_launch_stream<8>(cfg, d, s); break;
-        case 16: fa_launch_stream<16>(cfg, d, s); break;
-        case 32: fa_launch_stream<32>(cfg, d, s); break;
-        case 64: fa_launch_stream<64>(cfg, d, s); break;
-        case 128: fa_launch_stream<128>(cfg, d, s); break;
-        default: fa_die("unsupported stream --tile-y");
-        }
-        break;
     case FA_KERNEL_PAIR:
         switch (opt->tile_x * 1000000u + opt->tile_y * 1000u + opt->block_y) {
         case 26024006u: fa_launch_pair<1, 24, 6>(cfg, d, parity, s); break;
@@ -2531,21 +2154,6 @@ static void fa_launch_step(const fa_options_t *opt, fa_device_t *d, int parity,
         case 58012006u: fa_launch_pair<2, 12, 6>(cfg, d, parity, s); break;
         case 58012003u: fa_launch_pair<2, 12, 3>(cfg, d, parity, s); break;
         default: fa_die("unsupported pair --tile-x/--tile-y/--block combination");
-        }
-        break;
-    case FA_KERNEL_STEP:
-        if (opt->block_x != 32) {
-            fa_die("step kernel requires --block 32,<BY>");
-        }
-        switch (opt->tile_x * 1000000u + opt->tile_y * 1000u + opt->block_y) {
-        case 40040016u: fa_launch_step_kernel<40, 40, 16>(cfg, d, parity, s); break;
-        case 40040008u: fa_launch_step_kernel<40, 40, 8>(cfg, d, parity, s); break;
-        case 40024008u: fa_launch_step_kernel<40, 24, 8>(cfg, d, parity, s); break;
-        case 40056008u: fa_launch_step_kernel<40, 56, 8>(cfg, d, parity, s); break;
-        case 40056016u: fa_launch_step_kernel<40, 56, 16>(cfg, d, parity, s); break;
-        case 72024008u: fa_launch_step_kernel<72, 24, 8>(cfg, d, parity, s); break;
-        case 72024016u: fa_launch_step_kernel<72, 24, 16>(cfg, d, parity, s); break;
-        default: fa_die("unsupported step --tile-x/--tile-y/--block combination");
         }
         break;
     default:
@@ -2566,6 +2174,41 @@ static void fa_upload_state(const fa_fields_t *fields, fa_device_t *d)
     fa_cuda_check(cudaMemcpy(d->accum, fields->accum, sb, cudaMemcpyHostToDevice), "upload accum");
 }
 
+// Resolve --kernel auto and fill in the tuned launch geometry of each
+// variant where --block/--tile-x/--tile-y were not given.  "auto" selects
+// "regyf" while the six full-size fields of the per-stage scheme (base, two
+// stage buffers, accumulator, both velocities) fit in the L2 cache, and
+// "pair" (half the global traffic per step) once they do not.
+static void fa_resolve_kernel(fa_options_t *opt, size_t scalar_bytes)
+{
+    if (opt->kernel == FA_KERNEL_AUTO) {
+        int l2 = 0;
+        fa_cuda_check(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, 0), "L2 size");
+        opt->kernel = 6 * scalar_bytes <= (size_t)l2 ? FA_KERNEL_REGYF : FA_KERNEL_PAIR;
+    }
+    uint32_t bx = 32, by = 8, tx = 32, ty = 16;
+    switch (opt->kernel) {
+    case FA_KERNEL_SPLIT: by = 4; break;
+    case FA_KERNEL_REGY:
+    case FA_KERNEL_REGYF: ty = 24; break;
+    case FA_KERNEL_PAIR: by = 6; tx = 58; ty = 12; break;
+    default: break;
+    }
+    if (!opt->block_supplied) {
+        opt->block_x = bx;
+        opt->block_y = by;
+    }
+    if (opt->tile_x == 0) {
+        opt->tile_x = tx;
+    }
+    if (opt->tile_y == 0) {
+        opt->tile_y = ty;
+    }
+    if ((uint64_t)opt->block_x * opt->block_y > 1024) {
+        fa_die("block exceeds 1024 threads");
+    }
+}
+
 static void fa_run_cuda(const fa_options_t *opt, fa_fields_t *fields,
     fa_run_stats_t *stats)
 {
@@ -2583,7 +2226,7 @@ static void fa_run_cuda(const fa_options_t *opt, fa_fields_t *fields,
     fa_device_t d;
     memset(&d, 0, sizeof(d));
     fa_cuda_check(cudaMalloc((void **)&d.base, sb), "malloc base");
-    if (opt->kernel == FA_KERNEL_STEP || opt->kernel == FA_KERNEL_PAIR) {
+    if (opt->kernel == FA_KERNEL_PAIR) {
         fa_cuda_check(cudaMalloc((void **)&d.base_alt, sb), "malloc base_alt");
     }
     fa_cuda_check(cudaMalloc((void **)&d.stage[0], sb), "malloc stage0");
@@ -2695,7 +2338,7 @@ static void fa_usage(const char *argv0)
     fprintf(stderr,
         "usage: %s [--mode cpu|cuda] [--cells nx,ny] [--steps n] [--dt dt]\n"
         "          [--input path] [--output path] [--dump [path]] [--dump-bin [path]]\n"
-        "          [--kernel split|fused|tiled|prefetch|regy|regyf|stream|step|pair] [--block x[,y]]\n"
+        "          [--kernel auto|split|fused|tiled|prefetch|regy|regyf|pair] [--block x[,y]]\n"
         "          [--tile-x n] [--tile-y n] [--graph on|off]\n",
         argv0);
 }
@@ -2735,7 +2378,7 @@ int main(int argc, char **argv)
     opt.cfg.ny = 51;
     opt.cfg.steps = 500;
     opt.cfg.dt = 1.0e-4f;
-    opt.kernel = FA_KERNEL_FUSED;
+    opt.kernel = FA_KERNEL_AUTO;
     opt.graph = true;
     opt.tile_x = 0;
     opt.tile_y = 0;
@@ -2812,19 +2455,6 @@ int main(int argc, char **argv)
         }
     }
 
-    if (!opt.block_supplied) {
-        opt.block_x = 32;
-        opt.block_y = opt.kernel == FA_KERNEL_SPLIT ? 4 : 8;
-    }
-    if (opt.tile_x == 0) {
-        opt.tile_x = opt.kernel == FA_KERNEL_STEP ? 40 : 32;
-    }
-    if (opt.tile_y == 0) {
-        opt.tile_y = opt.kernel == FA_KERNEL_STEP ? 40 : 16;
-    }
-    if ((uint64_t)opt.block_x * opt.block_y > 1024) {
-        fa_die("block exceeds 1024 threads");
-    }
     fa_validate_cfg(&opt.cfg, opt.dt_supplied);
     fa_validate_working_set(&opt.cfg);
 
@@ -2842,6 +2472,7 @@ int main(int argc, char **argv)
     const double t_setup_end = fa_now_seconds();
     fa_run_stats_t stats;
     if (opt.cuda) {
+        fa_resolve_kernel(&opt, fields.scalar_len * sizeof(float));
         fa_run_cuda(&opt, &fields, &stats);
     } else {
         fa_run_cpu(&opt, &fields, &stats);
