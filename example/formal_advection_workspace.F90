@@ -5,6 +5,7 @@ module formal_advection_workspace
     private
     public :: fa_config_t, fa_options_t, fa_fields_t, fa_parse_args
     public :: fa_init_fields, fa_advance_rk4, fa_advance_rk4_fused, fa_advance_rk4_fused2
+    public :: fa_advance_rk4_regy
     public :: fa_write_csv, fa_reconstruct_scalar
     public :: fa_init_from_arrays, fa_write_final_raw
     public :: fa_validate_cfg, fa_validate_working_set, fa_read_raw_input
@@ -39,6 +40,10 @@ module formal_advection_workspace
     end type
 
     real(real32), allocatable, save :: fa_scalar_reconstruction_values(:,:)
+
+    ! Cells along y that one iteration of the interior loop of
+    ! fa_advance_rk4_regy computes.
+    integer, parameter :: fa_regy_rows = 3
 
 contains
 
@@ -1077,6 +1082,257 @@ contains
         end do
         deallocate(base, q, q2, acc, vx, vy)
     end subroutine fa_advance_rk4_fused2
+
+    ! The diffusive and advective flux at x face k of an interior face
+    ! (2 < k < nx): the interior rows of fa_face_fluxes_x, in their order.
+    pure subroutine fa_face_fluxes_x_interior(q, v, k, j, inv_dx, diffusion, fd, fa)
+        real(real32), intent(in) :: q(:,:), v(:,:)
+        integer, intent(in) :: k, j
+        real(real32), intent(in) :: inv_dx, diffusion
+        real(real32), intent(out) :: fd, fa
+        real(real32) :: g, c
+        g = inv_dx * ((1.0_real32 / 24.0_real32) * q(k - 1, j) &
+            + (-9.0_real32 / 8.0_real32) * q(k, j) &
+            + (9.0_real32 / 8.0_real32) * q(k + 1, j) &
+            + (-1.0_real32 / 24.0_real32) * q(k + 2, j))
+        c = (-7.0_real32 / 112.0_real32) * q(k - 1, j) &
+            + (63.0_real32 / 112.0_real32) * q(k, j) &
+            + (63.0_real32 / 112.0_real32) * q(k + 1, j) &
+            + (-7.0_real32 / 112.0_real32) * q(k + 2, j)
+        fd = diffusion * g
+        fa = v(k, j) * c
+    end subroutine fa_face_fluxes_x_interior
+
+    ! The diffusive and advective flux at y face k of an interior face
+    ! (2 < k < ny): the interior rows of fa_face_fluxes_y, in their order.
+    pure subroutine fa_face_fluxes_y_interior(q, v, i, k, inv_dy, diffusion, fd, fa)
+        real(real32), intent(in) :: q(:,:), v(:,:)
+        integer, intent(in) :: i, k
+        real(real32), intent(in) :: inv_dy, diffusion
+        real(real32), intent(out) :: fd, fa
+        real(real32) :: g, c
+        g = inv_dy * ((1.0_real32 / 24.0_real32) * q(i, k - 1) &
+            + (-9.0_real32 / 8.0_real32) * q(i, k) &
+            + (9.0_real32 / 8.0_real32) * q(i, k + 1) &
+            + (-1.0_real32 / 24.0_real32) * q(i, k + 2))
+        c = (-7.0_real32 / 112.0_real32) * q(i, k - 1) &
+            + (63.0_real32 / 112.0_real32) * q(i, k) &
+            + (63.0_real32 / 112.0_real32) * q(i, k + 1) &
+            + (-7.0_real32 / 112.0_real32) * q(i, k + 2)
+        fd = diffusion * g
+        fa = v(i, k) * c
+    end subroutine fa_face_fluxes_y_interior
+
+    ! fa_fused2_rhs of the fa_regy_rows cells (i, j0), ..., (i, j0 +
+    ! fa_regy_rows - 1) of the interior, where every face and divergence
+    ! uses the interior rows (5 <= i <= nx - 2, 5 <= j0, j0 + fa_regy_rows
+    ! - 1 <= ny - 2). The y faces between the cells are computed once for
+    ! all of them; every value is computed as in fa_fused2_rhs.
+    pure subroutine fa_regy_rhs(q, vx, vy, i, j0, inv_dx, inv_dy, diffusion, rhs)
+        real(real32), intent(in) :: q(:,:), vx(:,:), vy(:,:)
+        integer, intent(in) :: i, j0
+        real(real32), intent(in) :: inv_dx, inv_dy, diffusion
+        real(real32), intent(out) :: rhs(fa_regy_rows)
+        real(real32) :: yd(fa_regy_rows + 3), ya(fa_regy_rows + 3)
+        real(real32) :: fd(4), fa(4), dxd, dxa, dyd, dya
+        integer :: r, k, j
+        do r = 1, fa_regy_rows + 3
+            call fa_face_fluxes_y_interior(q, vy, i, j0 - 3 + r, inv_dy, diffusion, yd(r), ya(r))
+        end do
+        do r = 1, fa_regy_rows
+            j = j0 + r - 1
+            do k = 1, 4
+                call fa_face_fluxes_x_interior(q, vx, i - 3 + k, j, inv_dx, diffusion, fd(k), fa(k))
+            end do
+            dxd = inv_dx * ((1.0_real32 / 24.0_real32) * fd(1) &
+                + (-9.0_real32 / 8.0_real32) * fd(2) &
+                + (9.0_real32 / 8.0_real32) * fd(3) &
+                + (-1.0_real32 / 24.0_real32) * fd(4))
+            dxa = inv_dx * ((1.0_real32 / 24.0_real32) * fa(1) &
+                + (-9.0_real32 / 8.0_real32) * fa(2) &
+                + (9.0_real32 / 8.0_real32) * fa(3) &
+                + (-1.0_real32 / 24.0_real32) * fa(4))
+            dyd = inv_dy * ((1.0_real32 / 24.0_real32) * yd(r) &
+                + (-9.0_real32 / 8.0_real32) * yd(r + 1) &
+                + (9.0_real32 / 8.0_real32) * yd(r + 2) &
+                + (-1.0_real32 / 24.0_real32) * yd(r + 3))
+            dya = inv_dy * ((1.0_real32 / 24.0_real32) * ya(r) &
+                + (-9.0_real32 / 8.0_real32) * ya(r + 1) &
+                + (9.0_real32 / 8.0_real32) * ya(r + 2) &
+                + (-1.0_real32 / 24.0_real32) * ya(r + 3))
+            rhs(r) = (dxd + dyd) - (dxa + dya)
+        end do
+    end subroutine fa_regy_rhs
+
+    ! Cell t of the frame of fa_advance_rk4_regy: the cells (i, j),
+    ! 2 <= i <= nx + 1, 2 <= j <= ny + 1, outside the interior blocks
+    ! 5 <= i <= nx - 2, 5 <= j < jtop. First the rows (j < 5 or j >= jtop)
+    ! along x, then the three columns at each side of the block rows.
+    pure subroutine fa_regy_frame_cell(t, nx, ny, jtop, i, j)
+        integer, intent(in) :: t, nx, ny, jtop
+        integer, intent(out) :: i, j
+        integer :: s, n_row_cells, c
+        n_row_cells = (min(3, ny) + max(0, ny + 2 - max(jtop, 5))) * nx
+        if (t <= n_row_cells) then
+            s = (t - 1) / nx
+            i = 2 + (t - 1 - s * nx)
+            if (s < 3) then
+                j = 2 + s
+            else
+                j = max(jtop, 5) + s - 3
+            end if
+        else
+            s = t - 1 - n_row_cells
+            c = s / (jtop - 5)
+            j = 5 + (s - c * (jtop - 5))
+            if (c < 3) then
+                i = 2 + c
+            else
+                i = nx - 4 + c
+            end if
+        end if
+    end subroutine fa_regy_frame_cell
+
+    ! fa_advance_rk4_fused2 with the interior cells, whose faces and
+    ! divergences use only the interior operator rows, computed in blocks
+    ! of fa_regy_rows cells along y that share their y faces (fa_regy_rhs),
+    ! without any branch over the boundary rows. The frame of cells near
+    ! the boundaries runs fa_fused2_rhs in the same loop, in iterations
+    ! after those of the interior blocks (jb >= nb), so that it runs
+    ! alongside the interior rather than after it. Only fields%base is
+    ! written back: the stage buffers and the accumulator are the
+    ! routine's own, and fields%q and fields%acc are left as they are.
+    subroutine fa_advance_rk4_regy(fields, nx, ny, steps, dt, pi, diffusion)
+        type(fa_fields_t), intent(inout) :: fields
+        integer, intent(in) :: nx, ny, steps
+        real(real32), intent(in) :: dt, pi, diffusion
+        integer :: step, i, ii, j, jb, r, t, nb, nw, nf, jtop, n_frame
+        real(real32) :: inv_dx, inv_dy, half_dt, dt_over_6, rhs
+        real(real32) :: rhs_block(fa_regy_rows)
+        real(real32), allocatable :: base(:,:), q(:,:), q2(:,:), acc(:,:)
+        real(real32), allocatable :: vx(:,:), vy(:,:)
+
+        inv_dx = real(nx, real32) / (2.0_real32 * pi)
+        inv_dy = real(ny, real32) / (2.0_real32 * pi)
+        half_dt = 0.5_real32 * dt
+        dt_over_6 = dt / 6.0_real32
+        ! Interior blocks: i = 5:nx-2 (nw columns), j = 5:jtop-1 in nb
+        ! blocks of rows; then nf rows of nw frame cells.
+        if (nx >= 7) then
+            nb = max(0, ny - 6) / fa_regy_rows
+        else
+            nb = 0
+        end if
+        jtop = 5 + nb * fa_regy_rows
+        if (nb > 0) then
+            nw = nx - 6
+            n_frame = (3 + ny + 2 - jtop) * nx + 6 * (jtop - 5)
+        else
+            nw = nx
+            n_frame = nx * ny
+        end if
+        nf = (n_frame + nw - 1) / nw
+        allocate(base(1:nx + 2, 1:ny + 2))
+        allocate(q(1:nx + 2, 1:ny + 2))
+        allocate(q2(1:nx + 2, 1:ny + 2))
+        allocate(acc(1:nx + 2, 1:ny + 2))
+        allocate(vx(1:nx + 1, 1:ny + 2))
+        allocate(vy(1:nx + 2, 1:ny + 1))
+        do concurrent (j = 1:ny + 2, i = 1:nx + 1)
+            vx(i, j) = fields%vx(i, j)
+        end do
+        do concurrent (j = 1:ny + 1, i = 1:nx + 2)
+            vy(i, j) = fields%vy(i, j)
+        end do
+        do concurrent (j = 1:ny + 2, i = 1:nx + 2)
+            base(i, j) = fields%base(i, j)
+            q(i, j) = fields%base(i, j)
+            q2(i, j) = fields%base(i, j)
+            acc(i, j) = 0.0_real32
+        end do
+
+        do step = 1, steps
+            do concurrent (ii = 1:nw, jb = 0:nb + nf - 1) local(rhs_block, rhs, r, i, j, t)
+                if (jb < nb) then
+                    i = ii + 4
+                    call fa_regy_rhs(base, vx, vy, i, 5 + jb * fa_regy_rows, inv_dx, inv_dy, diffusion, rhs_block)
+                    do r = 1, fa_regy_rows
+                        j = 5 + jb * fa_regy_rows + r - 1
+                        acc(i, j) = rhs_block(r)
+                        q(i, j) = base(i, j) + half_dt * rhs_block(r)
+                    end do
+                else
+                    t = (jb - nb) * nw + ii
+                    if (t <= n_frame) then
+                        call fa_regy_frame_cell(t, nx, ny, jtop, i, j)
+                        rhs = fa_fused2_rhs(base, vx, vy, nx, ny, i, j, inv_dx, inv_dy, diffusion)
+                        acc(i, j) = rhs
+                        q(i, j) = base(i, j) + half_dt * rhs
+                    end if
+                end if
+            end do
+            do concurrent (ii = 1:nw, jb = 0:nb + nf - 1) local(rhs_block, rhs, r, i, j, t)
+                if (jb < nb) then
+                    i = ii + 4
+                    call fa_regy_rhs(q, vx, vy, i, 5 + jb * fa_regy_rows, inv_dx, inv_dy, diffusion, rhs_block)
+                    do r = 1, fa_regy_rows
+                        j = 5 + jb * fa_regy_rows + r - 1
+                        acc(i, j) = acc(i, j) + 2.0_real32 * rhs_block(r)
+                        q2(i, j) = base(i, j) + half_dt * rhs_block(r)
+                    end do
+                else
+                    t = (jb - nb) * nw + ii
+                    if (t <= n_frame) then
+                        call fa_regy_frame_cell(t, nx, ny, jtop, i, j)
+                        rhs = fa_fused2_rhs(q, vx, vy, nx, ny, i, j, inv_dx, inv_dy, diffusion)
+                        acc(i, j) = acc(i, j) + 2.0_real32 * rhs
+                        q2(i, j) = base(i, j) + half_dt * rhs
+                    end if
+                end if
+            end do
+            do concurrent (ii = 1:nw, jb = 0:nb + nf - 1) local(rhs_block, rhs, r, i, j, t)
+                if (jb < nb) then
+                    i = ii + 4
+                    call fa_regy_rhs(q2, vx, vy, i, 5 + jb * fa_regy_rows, inv_dx, inv_dy, diffusion, rhs_block)
+                    do r = 1, fa_regy_rows
+                        j = 5 + jb * fa_regy_rows + r - 1
+                        acc(i, j) = acc(i, j) + 2.0_real32 * rhs_block(r)
+                        q(i, j) = base(i, j) + dt * rhs_block(r)
+                    end do
+                else
+                    t = (jb - nb) * nw + ii
+                    if (t <= n_frame) then
+                        call fa_regy_frame_cell(t, nx, ny, jtop, i, j)
+                        rhs = fa_fused2_rhs(q2, vx, vy, nx, ny, i, j, inv_dx, inv_dy, diffusion)
+                        acc(i, j) = acc(i, j) + 2.0_real32 * rhs
+                        q(i, j) = base(i, j) + dt * rhs
+                    end if
+                end if
+            end do
+            do concurrent (ii = 1:nw, jb = 0:nb + nf - 1) local(rhs_block, rhs, r, i, j, t)
+                if (jb < nb) then
+                    i = ii + 4
+                    call fa_regy_rhs(q, vx, vy, i, 5 + jb * fa_regy_rows, inv_dx, inv_dy, diffusion, rhs_block)
+                    do r = 1, fa_regy_rows
+                        j = 5 + jb * fa_regy_rows + r - 1
+                        base(i, j) = base(i, j) + dt_over_6 * (acc(i, j) + rhs_block(r))
+                    end do
+                else
+                    t = (jb - nb) * nw + ii
+                    if (t <= n_frame) then
+                        call fa_regy_frame_cell(t, nx, ny, jtop, i, j)
+                        rhs = fa_fused2_rhs(q, vx, vy, nx, ny, i, j, inv_dx, inv_dy, diffusion)
+                        base(i, j) = base(i, j) + dt_over_6 * (acc(i, j) + rhs)
+                    end if
+                end if
+            end do
+        end do
+
+        do concurrent (j = 1:ny + 2, i = 1:nx + 2)
+            fields%base(i, j) = base(i, j)
+        end do
+        deallocate(base, q, q2, acc, vx, vy)
+    end subroutine fa_advance_rk4_regy
 
     subroutine fa_write_csv(path, fields, nx, ny)
         character(len=*), intent(in) :: path

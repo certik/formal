@@ -313,3 +313,76 @@ the native CPU oracle on all cases of the record above (Gaussian 17x13/9,
 2048²/1000 benchmark input `fused2` differs from the original Formal final
 by at most 2.4e-7 (relative L2 4.1e-8). Formal's FPM test suite passes
 (32/32) with `--gpu=cuda` and `--gpu=cuda_cpu`.
+
+### `regy`: register-blocked interior and frame in one loop
+
+`--workspace-kernel regy` (`fa_advance_rk4_regy`) brings the structure
+of the native `regyf` to the LFortran-compiled workspace, in Fortran:
+
+- The interior cells, `5 <= i <= nx - 2`, `5 <= j <= ny - 2`, whose faces
+  and divergences use only the interior operator rows, are computed in
+  blocks of `fa_regy_rows = 3` consecutive cells along y
+  (`fa_regy_rhs`). An iteration computes the 6 y faces of its 3 cells once
+  and shares them, instead of each cell computing 4, and runs no branch
+  over the boundary rows.
+- The frame of cells near the boundaries runs `fa_fused2_rhs` in the same
+  `do concurrent` of the stage, as iterations after those of the interior
+  blocks, so the frame threads run alongside the interior ones rather than
+  in a kernel of their own after them.
+- Only `fields%base` is written back at the end; the stage buffers and the
+  accumulator are the routine's own.
+
+The operator rows, the order of every sum and the RK4 update are those of
+`fa_advance_rk4_fused2`. Variants measured on the way (solve-wall medians,
+2048² / 1000 steps):
+
+| variant | s |
+|---|---:|
+| `fused2` | 0.229 |
+| interior y blocks (3 rows) + frame in a second loop per stage | 0.128 |
+| same with 2 rows | 0.125 |
+| same with 4 rows | 0.130 |
+| interior y blocks (2 rows), frame in the same loop | 0.119 |
+| interior y blocks (3 rows), frame in the same loop | 0.113 |
+| + write back only `fields%base` (`regy`) | **0.106** |
+| native `regyf`, same runs | 0.120 |
+
+A separate frame loop costs 6 µs per stage (a latency-bound kernel of
+~30 000 threads, 16% occupancy) after the 20-23 µs interior kernel. A
+variant with one loop over the whole domain in 3-row blocks, which takes
+the general rows in every iteration that touches the frame, ran 0.175 s.
+
+Interleaved medians of 5 (`regy` 0.1058 s, native `regyf` 0.1196 s in the
+same runs). Per timestep, Nsight Compute (application replay, as above,
+2048² Gaussian):
+
+| build, variant | ms/step | DRAM MB/step | % DRAM peak | L2 MB/step | L2 TB/s | GFLOP/step | % FP32 peak |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| LFortran, `fused2` | 0.229 | 66 | 18.0% | 634 | 2.77 | 2.92 | 10.9% |
+| LFortran, `regy` | 0.106 | 57 | 32.9% | 575 | 5.33 | 2.18 | 17.3% |
+| native `regyf` | 0.116 | 58 | 30.5% | 619 | 5.21 | 1.41 | 10.1% |
+
+The stage kernels run 22-26 µs (96 ms of kernel time per 1000 steps) at
+the measured L2-resident copy rate (5.5 TB/s): like `regyf`, `regy` is
+L2-bandwidth bound. It moves 7% fewer L2 bytes than `regyf` (32 x 24-cell
+blocks with a 3-cell halo in L1 rather than a 40 x 32 shared-memory tile)
+and executes 1.5x its floating point operations (x faces are still
+computed by the 4 cells that use them). `solve_seconds` still contains the
+upload of `base`, `vx` and `vy` at routine entry (6-9 ms), which the native
+`solve_wall` excludes.
+
+`regy` needs LFortran with commit 654ad4db77 ("keep module constants of
+separately compiled device procedures"): before it, `fa_regy_rhs`, whose
+loop bounds use the module constant `fa_regy_rows`, failed to compile with
+`--separate-compilation --gpu=cuda` ("identifier \"fa_regy_rows\" is
+undefined" from nvcc).
+
+Validation: `regy` passed `compare_2d_raw_fields.py` (default
+tolerances, `--evolution`, fixed boundaries) against the LFortran Formal
+finals and the native CPU oracle on every case above (Gaussian 17x13/9,
+51x51/500, 130x67/50, 257x257/200, 1000x700/20, 2048x2048/20,
+2048x2048/1000; boundary 13x11/3, 37x23/7, 70x45/20, 613x451/10). On the
+2048²/1000 input it differs from the CPU oracle by at most 1.8e-7
+(relative L2 4.8e-8) and from the original Formal final by 4.2e-7
+(relative L2 7.8e-8). Formal's FPM test suite passes (32/32) with
+`--gpu=cuda` and `--gpu=cuda_cpu`.

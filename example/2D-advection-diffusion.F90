@@ -37,6 +37,7 @@ program advection_diffusion_2D
      fa_advance_rk4 &
     ,fa_advance_rk4_fused &
     ,fa_advance_rk4_fused2 &
+    ,fa_advance_rk4_regy &
     ,fa_fields_t &
     ,fa_init_from_arrays &
     ,fa_read_raw_input &
@@ -98,7 +99,7 @@ program advection_diffusion_2D
       // '    --example 2D-advection-diffusion \' // new_line('') &
       // '    --compiler flang \' // new_line('') &
       // '    --flag "-O3" \' // new_line('') &
-      // '    -- [--solver workspace|operators] [--cells <n[,m]>] [--steps <integer>] [--dt <real>] [--order <integer>] [--benchmark] [--no-csv] [--dump-input <path>] [--dump-final-raw <path>] [--input <path>] [--workspace-kernel split|fused|fused2] [--gpu-profile]' // new_line('') &
+      // '    -- [--solver workspace|operators] [--cells <n[,m]>] [--steps <integer>] [--dt <real>] [--order <integer>] [--benchmark] [--no-csv] [--dump-input <path>] [--dump-final-raw <path>] [--input <path>] [--workspace-kernel split|fused|fused2|regy] [--gpu-profile]' // new_line('') &
       // '  or use the no-argument legacy regression case (51x51, 500 steps, dt = 1e-4).' // new_line('') // new_line('') &
       // 'When --dt is omitted, the default time step scales as 1e-4 * min(51/Nx, 51/Ny)^2.' // new_line('') // new_line('') &
       // 'Use --benchmark for the 257x257, 30000-step preset; explicit --cells, --steps, and --dt override the preset.' // new_line('') // new_line('') &
@@ -178,6 +179,8 @@ program advection_diffusion_2D
       call fa_advance_rk4_fused(workspace_fields, args%cells(1), args%cells(2), 1, args%dt, pi, 0.5E0)
     case (2)
       call fa_advance_rk4_fused2(workspace_fields, args%cells(1), args%cells(2), 1, args%dt, pi, 0.5E0)
+    case (3)
+      call fa_advance_rk4_regy(workspace_fields, args%cells(1), args%cells(2), 1, args%dt, pi, 0.5E0)
     case default
       call fa_advance_rk4(workspace_fields, args%cells(1), args%cells(2), 1, args%dt, pi, 0.5E0)
     end select
@@ -208,6 +211,8 @@ program advection_diffusion_2D
       call fa_advance_rk4_fused(workspace_fields, args%cells(1), args%cells(2), args%steps, args%dt, pi, 0.5E0)
     case (2)
       call fa_advance_rk4_fused2(workspace_fields, args%cells(1), args%cells(2), args%steps, args%dt, pi, 0.5E0)
+    case (3)
+      call fa_advance_rk4_regy(workspace_fields, args%cells(1), args%cells(2), args%steps, args%dt, pi, 0.5E0)
     case default
       call fa_advance_rk4(workspace_fields, args%cells(1), args%cells(2), args%steps, args%dt, pi, 0.5E0)
     end select
@@ -385,8 +390,10 @@ contains
         numerical_arguments%workspace_kernel = 1
       case ("fused2")
         numerical_arguments%workspace_kernel = 2
+      case ("regy")
+        numerical_arguments%workspace_kernel = 3
       case default
-        error stop "--workspace-kernel must be split, fused or fused2"
+        error stop "--workspace-kernel must be split, fused, fused2 or regy"
       end select
     end if
 
