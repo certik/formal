@@ -210,8 +210,8 @@ are kept from the previous chunk); those cells take their y part from the
 general rows.  Frame tiles are split into `--frame-parts` (default 2) row
 parts so that they finish with the interior blocks.
 
-At 4096² (DRAM resident) `march` moves 279 MB of DRAM traffic per step
-(`pair` 747 MB, `lean2` 819 MB) and is 2.0x faster than `pair`.  It is
+At 4096² (DRAM resident) `march` moves 279-293 MB of DRAM traffic per step
+(`pair` 747 MB, `lean2` 819 MB) and is 2.2x faster than `pair`.  It is
 latency bound: 239-255 registers leave two warps per scheduler, and PC
 sampling shows ~40% of the stall samples on long-scoreboard waits for the
 per-stage reloads of base and the velocities (the per-SM working set of the
@@ -349,10 +349,10 @@ Which roof applies:
   leaves L2.
 - **4096² is DRAM-resident.**  The per-stage scheme (`regyf`, `lean`) runs
   at the DRAM copy limit, so the only way forward is fewer bytes: `pair`
-  and `lean2` halve them, `march` cuts them to 279 MB per step (1.04x the
-  compulsory 269 MB).  `march` then runs at 53% of the DRAM peak and is
-  latency bound (31% issue, 239-255 registers); at the DRAM roof it would
-  take ~0.19 ms/step.
+  and `lean2` halve them, `march` cuts them to 293 MB per step (1.09x the
+  compulsory 269 MB).  `march` then runs at 62% of the DRAM peak (57% of
+  the compulsory-traffic roof) and is latency bound (30% issue, 255
+  registers); at the DRAM roof it would take ~0.18 ms/step.
 - **FP32 is never the limit**: at most 22 TFLOP/s (19% of peak).  `lean2`
   performs 4.8 FLOP per byte of L2 traffic, against a machine balance of
   117 TFLOP/s / 5.5 TB/s = 21 FLOP/byte.
