@@ -243,3 +243,73 @@ L2-resident problems, in order of measured impact:
    the stage-1/3 values and rates on chip; `base` is double-buffered
    between timesteps because neighbouring tiles read its halo.  This halves
    DRAM traffic (1685 → 747 MB/step at 4096²) and is 1.72x faster there.
+
+## LFortran-compiled fused workspace variants
+
+The Formal example has two more workspace variants, selected with
+`--workspace-kernel` (the default, `split`, is the original
+`fa_advance_rk4`):
+
+- `fused` (`fa_advance_rk4_fused`): one `do concurrent` per RK stage, the
+  structure of the native `fused` variant without shared memory. Every
+  interior cell computes the diffusive and advective face fluxes its
+  divergence needs where it needs them, so no face array is stored; stage
+  inputs alternate between two buffers, stage 1 reads `base` and stage 4
+  updates `base` directly.
+- `fused2` (`fa_advance_rk4_fused2`): `fused` with each face's diffusive
+  and advective flux computed together from one set of loads. In `fused`
+  they are separate calls with their own branches over the boundary rows,
+  and the device compiler loads every scalar value twice.
+
+Both apply the same operator rows and RK4 update in the operation order of
+`fa_advance_rk4`. Build and run as the LFortran baseline above, adding
+`--workspace-kernel fused2`.
+
+Each LFortran column below is a build of the CUDA backend: the compiler
+before this work; with loop nests of two or more dimensions launched in
+32 x 8 tiles instead of one flat range of 256 consecutive iterations of
+the fastest dimension ("tiles"); and with that plus no copy-in of an array
+a launch assigns whole ("no copy-in"). `fused2` has more kernels than the
+CUDA runtime before this work could register (64), so every build also
+lets the registry grow. Solve-wall medians of 5 interleaved runs at
+2048² / 1000 steps (s); the LFortran `solve_seconds` also contains the
+copies at routine entry and exit (about 36 ms before "no copy-in", 12 ms
+after), which the native `solve_wall` does not:
+
+| variant | LFortran before | + tiles | + no copy-in | native |
+|---|---:|---:|---:|---:|
+| `split` | 0.576 | 0.575 | 0.556 | 0.559 |
+| `fused` | 0.521 | 0.391 | 0.363 | 0.203 |
+| `fused2` | 0.328 | 0.254 | **0.229** | |
+| `regyf` | | | | 0.119 |
+
+Per timestep (Nsight Compute, application replay, as above):
+
+| build, variant | DRAM MB/step | % DRAM peak | L2 MB/step | L2 TB/s | GFLOP/step | % FP32 peak |
+|---|---:|---:|---:|---:|---:|---:|
+| LFortran before, `split` | 605 | 65.7% | 1692 | 2.94 | 1.21 | 1.8% |
+| LFortran before, `fused` | 66 | 7.9% | 1080 | 2.07 | 2.92 | 4.8% |
+| LFortran + tiles + no copy-in, `fused` | 66 | 11.3% | 635 | 1.75 | 2.92 | 6.9% |
+| LFortran + tiles + no copy-in, `fused2` | 66 | 18.0% | 634 | 2.77 | 2.92 | 10.9% |
+| native `fused` | 61 | 18.7% | 643 | 3.17 | 1.60 | 6.8% |
+| native `regyf` | 58 | 30.5% | 619 | 5.21 | 1.41 | 10.1% |
+
+The flat launch made each block of a fused stage read eight rows of the
+stage input for the y stencil from L2 (1080 MB/step); 32 x 8 tiles bring
+L2 traffic to the native level. What separates `fused2` from native
+`fused` (53-55 vs 50-52 µs per stage kernel) and `fused` from `fused2` is
+on-chip reuse: without shared memory every face flux is computed by the
+four cells whose divergence uses it, so the LFortran kernels execute 1.8x
+the floating point operations of the native one and load each scalar
+value from L1 many times (3.6 GB of L1 traffic per step for `fused2`,
+6.3 GB for `fused`, 0.7 GB native).
+
+Validation: `split`, `fused` and `fused2` from every build above passed
+`compare_2d_raw_fields.py` (default `rtol=1e-6`, `atol=1e-8`,
+`--evolution`, fixed boundaries) against the LFortran Formal finals and
+the native CPU oracle on all cases of the record above (Gaussian 17x13/9,
+51x51/500, 130x67/50, 257x257/200, 1000x700/20, 2048x2048/20 and
+2048x2048/1000; boundary 13x11/3, 37x23/7, 70x45/20, 613x451/10). On the
+2048²/1000 benchmark input `fused2` differs from the original Formal final
+by at most 2.4e-7 (relative L2 4.1e-8). Formal's FPM test suite passes
+(32/32) with `--gpu=cuda` and `--gpu=cuda_cpu`.
