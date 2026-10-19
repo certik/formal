@@ -2254,7 +2254,7 @@ __device__ __forceinline__ void fa_m2_stage(int a, int t, const fa_march_geo_t &
     float (*fd)[64 * NW + 8], float (*fa)[64 * NW + 8], float (*xs)[2][FA_M_R],
     float (&cur)[2][FA_M_R], float (&accv)[2][FA_M_R], float (&rc)[2][3],
     float (&ydc)[2][3], float (&yac)[2][3], float (&ac)[2][3], float (&cap)[2][3],
-    bool prefetch)
+    bool prefetch, float2 (&nv)[3][FA_M_R], float2 (&cv)[3][3])
 {
     constexpr int R = FA_M_R;
     constexpr int NT = 32 * NW;
@@ -2265,21 +2265,45 @@ __device__ __forceinline__ void fa_m2_stage(int a, int t, const fa_march_geo_t &
     const int b = a - 3 * S;            // output rows [b, b + R)
 
     // All global loads of the stage first (their latency overlaps the
-    // first barrier): y-face and x-face velocities and base.
+    // first barrier): y-face and x-face velocities and base.  Stages 2 and
+    // 4 run three rows behind stages 1 and 3 and take these from them
+    // (nv: R - 3 rows of the current chunk and cv: 3 rows of the previous
+    // one) instead of reloading them.
     float2 vyl[R];
     float2 vxl[R];
     float2 bl[R];
+    if (S % 2 == 1) {
 #pragma unroll
-    for (int q = 0; q < R; ++q) {
-        vyl[q] = fa_ld2(m.vy + c + ps * (b + 1 + q));
-    }
+        for (int q = 0; q < R; ++q) {
+            vyl[q] = fa_ld2(m.vy + c + ps * (b + 1 + q));
+        }
 #pragma unroll
-    for (int q = 0; q < R; ++q) {
-        vxl[q] = fa_ld2(m.vx + c + m.pf * (b + q));
-    }
+        for (int q = 0; q < R; ++q) {
+            vxl[q] = fa_ld2(m.vx + c + m.pf * (b + q));
+        }
 #pragma unroll
-    for (int q = 0; q < R; ++q) {
-        bl[q] = fa_ld2(m.bin + c + ps * (b + q));
+        for (int q = 0; q < R; ++q) {
+            bl[q] = fa_ld2(m.bin + c + ps * (b + q));
+        }
+#pragma unroll
+        for (int q = 0; q < R; ++q) {
+            nv[0][q] = q < 3 ? cv[0][q] : vyl[q - 3];
+            nv[1][q] = q < 3 ? cv[1][q] : vxl[q - 3];
+            nv[2][q] = q < 3 ? cv[2][q] : bl[q - 3];
+        }
+#pragma unroll
+        for (int q = 0; q < 3; ++q) {
+            cv[0][q] = vyl[R - 3 + q];
+            cv[1][q] = vxl[R - 3 + q];
+            cv[2][q] = bl[R - 3 + q];
+        }
+    } else {
+#pragma unroll
+        for (int q = 0; q < R; ++q) {
+            vyl[q] = nv[0][q];
+            vxl[q] = nv[1][q];
+            bl[q] = nv[2][q];
+        }
     }
 
     // Stage-input rows [b, b + R + 3) (three carried) and y faces
@@ -2567,6 +2591,17 @@ __device__ __forceinline__ void fa_m2_run(const fa_march_geo_t &g, int K,
     const int skip = g.y_lo - 12 - g.r0;
     float cur[2][R];
     float accv[2][R];
+    float2 nv[3][R], cv[2][3][3];
+#pragma unroll
+    for (int s2 = 0; s2 < 2; ++s2) {
+#pragma unroll
+        for (int i = 0; i < 3; ++i) {
+#pragma unroll
+            for (int q = 0; q < 3; ++q) {
+                cv[s2][i][q] = make_float2(0.0f, 0.0f);
+            }
+        }
+    }
     bool have = false;                  // cur already holds the chunk input
     for (int k = 0; k < K; ++k) {
         const int a = g.r0 + k * R;
@@ -2583,18 +2618,18 @@ __device__ __forceinline__ void fa_m2_run(const fa_march_geo_t &g, int K,
         const int kr = (k + 2) * R - skip;
         const bool pf = k + 1 < K;
         fa_m2_stage<NW, 1, FRAME, YM>(a, t, g, p, m, xb, fd, fa, xs, cur, accv, rc[0],
-            ydc[0], yac[0], ac[0], cap[0], false);
+            ydc[0], yac[0], ac[0], cap[0], false, nv, cv[0]);
         if (kr > 12) {
             fa_m2_stage<NW, 2, FRAME, YM>(a, t, g, p, m, xb, fd, fa, xs, cur, accv, rc[1],
-                ydc[1], yac[1], ac[1], cap[1], false);
+                ydc[1], yac[1], ac[1], cap[1], false, nv, cv[0]);
         }
         if (kr > 18) {
             fa_m2_stage<NW, 3, FRAME, YM>(a, t, g, p, m, xb, fd, fa, xs, cur, accv, rc[2],
-                ydc[2], yac[2], ac[2], cap[2], false);
+                ydc[2], yac[2], ac[2], cap[2], false, nv, cv[1]);
         }
         if (kr > 24) {
             fa_m2_stage<NW, 4, FRAME, YM>(a, t, g, p, m, xb, fd, fa, xs, cur, accv, rc[3],
-                ydc[3], yac[3], ac[3], cap[3], pf);
+                ydc[3], yac[3], ac[3], cap[3], pf, nv, cv[1]);
         }
         have = kr > 24 && pf;
     }
@@ -4018,7 +4053,7 @@ static void fa_resolve_kernel(fa_options_t *opt, size_t scalar_bytes)
     case FA_KERNEL_REGY:
     case FA_KERNEL_REGYF: ty = 24; break;
     case FA_KERNEL_PAIR: by = 6; tx = 58; ty = 12; break;
-    case FA_KERNEL_MARCH: bx = 128; by = 1; tx = 230; ty = 64; break;
+    case FA_KERNEL_MARCH: bx = 128; by = 1; tx = 230; ty = 128; break;
     case FA_KERNEL_LEAN:
         // Tuned at 2048^2 (96 threads, 32 rows) and 1024^2 (64, 24).
         bx = (uint64_t)opt->cfg.nx * opt->cfg.ny >= 2000000 ? 96 : 64;

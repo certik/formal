@@ -218,6 +218,13 @@ kernel took 420 µs because the compiler did not unroll its general code
 (moved out of the unrolled loops into parallel fix-ups) and clamped every
 load (replaced by the padded layout); issuing each stage's loads before its
 first barrier and loading the next chunk in stage 4 gained 3% at 2048².
+As in `lean2`, stages 2 and 4 now take the velocities and base of their
+rows from stages 1 and 3 (three rows carried per column pair, the rest
+from the current chunk) instead of reloading them; the interior kernel
+stays at 255 registers with a 40-byte spill: 4096² 0.321 → 0.297 s at
+128 threads / 128 rows per segment / 2 frame parts (the new default; the
+segment height matters through the balance of frame and interior blocks:
+64 rows 0.317, 96 0.316, 160 0.321, 256 0.303 s).
 Rejected: `prefetch.global.L1` of the next chunk's rows (no gain), a
 smaller shared-memory carveout for more L1 (no gain), forcing 168
 registers (spills, slower), launching the frame grids first with
