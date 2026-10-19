@@ -4,7 +4,7 @@ module formal_advection_workspace
     implicit none
     private
     public :: fa_config_t, fa_options_t, fa_fields_t, fa_parse_args
-    public :: fa_init_fields, fa_advance_rk4, fa_write_csv, fa_reconstruct_scalar
+    public :: fa_init_fields, fa_advance_rk4, fa_advance_rk4_fused, fa_write_csv, fa_reconstruct_scalar
     public :: fa_init_from_arrays, fa_write_final_raw
     public :: fa_validate_cfg, fa_validate_working_set, fa_read_raw_input
     public :: fa_now_seconds
@@ -601,6 +601,169 @@ contains
         deallocate(vx_local)
         deallocate(vy_local)
     end subroutine fa_advance_rk4
+
+    ! Face flux of the scalar q at x face (k, j): diffusive (diffusion * grad)
+    ! or advective (v * interp), exactly as fa_advance_rk4 stores them in
+    ! diff_x and adv_x.
+    pure real(real32) function fa_flux_x(q, v, nx, ny, k, j, inv_dx, diffusion, advective) result(f)
+        real(real32), intent(in) :: q(:,:), v(:,:)
+        integer, intent(in) :: nx, ny, k, j
+        real(real32), intent(in) :: inv_dx, diffusion
+        logical, intent(in) :: advective
+        if (advective) then
+            f = v(k, j) * fa_interp_face_x(q, nx, ny, k, j)
+        else
+            f = diffusion * fa_grad_face_x(q, nx, ny, k, j, inv_dx)
+        end if
+    end function fa_flux_x
+
+    pure real(real32) function fa_flux_y(q, v, nx, ny, i, k, inv_dy, diffusion, advective) result(f)
+        real(real32), intent(in) :: q(:,:), v(:,:)
+        integer, intent(in) :: nx, ny, i, k
+        real(real32), intent(in) :: inv_dy, diffusion
+        logical, intent(in) :: advective
+        if (advective) then
+            f = v(i, k) * fa_interp_face_y(q, nx, ny, i, k)
+        else
+            f = diffusion * fa_grad_face_y(q, nx, ny, i, k, inv_dy)
+        end if
+    end function fa_flux_y
+
+    ! fa_div_face_x applied to the x face fluxes of q, computed on the fly.
+    pure real(real32) function fa_fused_div_x(q, v, nx, ny, i, j, inv_dx, diffusion, advective) result(d)
+        real(real32), intent(in) :: q(:,:), v(:,:)
+        integer, intent(in) :: nx, ny, i, j
+        real(real32), intent(in) :: inv_dx, diffusion
+        logical, intent(in) :: advective
+        integer :: n
+        n = nx + 1
+        if (i == 1) then
+            d = inv_dx * ((-11.0_real32 / 12.0_real32) * fa_flux_x(q, v, nx, ny, 1, j, inv_dx, diffusion, advective) &
+                + (17.0_real32 / 24.0_real32) * fa_flux_x(q, v, nx, ny, 2, j, inv_dx, diffusion, advective) &
+                + (3.0_real32 / 8.0_real32) * fa_flux_x(q, v, nx, ny, 3, j, inv_dx, diffusion, advective) &
+                + (-5.0_real32 / 24.0_real32) * fa_flux_x(q, v, nx, ny, 4, j, inv_dx, diffusion, advective) &
+                + (1.0_real32 / 24.0_real32) * fa_flux_x(q, v, nx, ny, 5, j, inv_dx, diffusion, advective))
+        else if (i + 1 < n) then
+            d = inv_dx * ((1.0_real32 / 24.0_real32) * fa_flux_x(q, v, nx, ny, i - 1, j, inv_dx, diffusion, advective) &
+                + (-9.0_real32 / 8.0_real32) * fa_flux_x(q, v, nx, ny, i, j, inv_dx, diffusion, advective) &
+                + (9.0_real32 / 8.0_real32) * fa_flux_x(q, v, nx, ny, i + 1, j, inv_dx, diffusion, advective) &
+                + (-1.0_real32 / 24.0_real32) * fa_flux_x(q, v, nx, ny, i + 2, j, inv_dx, diffusion, advective))
+        else
+            d = inv_dx * ((-1.0_real32 / 24.0_real32) * fa_flux_x(q, v, nx, ny, n - 4, j, inv_dx, diffusion, advective) &
+                + (5.0_real32 / 24.0_real32) * fa_flux_x(q, v, nx, ny, n - 3, j, inv_dx, diffusion, advective) &
+                + (-3.0_real32 / 8.0_real32) * fa_flux_x(q, v, nx, ny, n - 2, j, inv_dx, diffusion, advective) &
+                + (-17.0_real32 / 24.0_real32) * fa_flux_x(q, v, nx, ny, n - 1, j, inv_dx, diffusion, advective) &
+                + (11.0_real32 / 12.0_real32) * fa_flux_x(q, v, nx, ny, n, j, inv_dx, diffusion, advective))
+        end if
+    end function fa_fused_div_x
+
+    ! fa_div_face_y applied to the y face fluxes of q, computed on the fly.
+    pure real(real32) function fa_fused_div_y(q, v, nx, ny, i, j, inv_dy, diffusion, advective) result(d)
+        real(real32), intent(in) :: q(:,:), v(:,:)
+        integer, intent(in) :: nx, ny, i, j
+        real(real32), intent(in) :: inv_dy, diffusion
+        logical, intent(in) :: advective
+        integer :: n
+        n = ny + 1
+        if (j == 1) then
+            d = inv_dy * ((-11.0_real32 / 12.0_real32) * fa_flux_y(q, v, nx, ny, i, 1, inv_dy, diffusion, advective) &
+                + (17.0_real32 / 24.0_real32) * fa_flux_y(q, v, nx, ny, i, 2, inv_dy, diffusion, advective) &
+                + (3.0_real32 / 8.0_real32) * fa_flux_y(q, v, nx, ny, i, 3, inv_dy, diffusion, advective) &
+                + (-5.0_real32 / 24.0_real32) * fa_flux_y(q, v, nx, ny, i, 4, inv_dy, diffusion, advective) &
+                + (1.0_real32 / 24.0_real32) * fa_flux_y(q, v, nx, ny, i, 5, inv_dy, diffusion, advective))
+        else if (j + 1 < n) then
+            d = inv_dy * ((1.0_real32 / 24.0_real32) * fa_flux_y(q, v, nx, ny, i, j - 1, inv_dy, diffusion, advective) &
+                + (-9.0_real32 / 8.0_real32) * fa_flux_y(q, v, nx, ny, i, j, inv_dy, diffusion, advective) &
+                + (9.0_real32 / 8.0_real32) * fa_flux_y(q, v, nx, ny, i, j + 1, inv_dy, diffusion, advective) &
+                + (-1.0_real32 / 24.0_real32) * fa_flux_y(q, v, nx, ny, i, j + 2, inv_dy, diffusion, advective))
+        else
+            d = inv_dy * ((-1.0_real32 / 24.0_real32) * fa_flux_y(q, v, nx, ny, i, n - 4, inv_dy, diffusion, advective) &
+                + (5.0_real32 / 24.0_real32) * fa_flux_y(q, v, nx, ny, i, n - 3, inv_dy, diffusion, advective) &
+                + (-3.0_real32 / 8.0_real32) * fa_flux_y(q, v, nx, ny, i, n - 2, inv_dy, diffusion, advective) &
+                + (-17.0_real32 / 24.0_real32) * fa_flux_y(q, v, nx, ny, i, n - 1, inv_dy, diffusion, advective) &
+                + (11.0_real32 / 12.0_real32) * fa_flux_y(q, v, nx, ny, i, n, inv_dy, diffusion, advective))
+        end if
+    end function fa_fused_div_y
+
+    ! Right-hand side at interior cell (i, j), in the operation order of
+    ! fa_advance_rk4: (div diff_x + div diff_y) - (div adv_x + div adv_y).
+    pure real(real32) function fa_fused_rhs(q, vx, vy, nx, ny, i, j, inv_dx, inv_dy, diffusion) result(rhs)
+        real(real32), intent(in) :: q(:,:), vx(:,:), vy(:,:)
+        integer, intent(in) :: nx, ny, i, j
+        real(real32), intent(in) :: inv_dx, inv_dy, diffusion
+        rhs = (fa_fused_div_x(q, vx, nx, ny, i - 1, j, inv_dx, diffusion, .false.) &
+            + fa_fused_div_y(q, vy, nx, ny, i, j - 1, inv_dy, diffusion, .false.)) &
+            - (fa_fused_div_x(q, vx, nx, ny, i - 1, j, inv_dx, diffusion, .true.) &
+            + fa_fused_div_y(q, vy, nx, ny, i, j - 1, inv_dy, diffusion, .true.))
+    end function fa_fused_rhs
+
+    ! The method of fa_advance_rk4 with one `do concurrent` per RK stage: the
+    ! face fluxes are computed where the divergence needs them, so no face
+    ! arrays are stored.  Stage inputs alternate between two buffers (a stage
+    ! cannot overwrite the field its neighbours still read): stage 1 reads
+    ! base, stages 2-4 read q or q2, and stage 4 updates base directly.
+    ! Boundary values are never written, so every buffer keeps those of base.
+    subroutine fa_advance_rk4_fused(fields, nx, ny, steps, dt, pi, diffusion)
+        type(fa_fields_t), intent(inout) :: fields
+        integer, intent(in) :: nx, ny, steps
+        real(real32), intent(in) :: dt, pi, diffusion
+        integer :: step, i, j
+        real(real32) :: inv_dx, inv_dy, half_dt, dt_over_6, rhs
+        real(real32), allocatable :: base(:,:), q(:,:), q2(:,:), acc(:,:)
+        real(real32), allocatable :: vx(:,:), vy(:,:)
+
+        inv_dx = real(nx, real32) / (2.0_real32 * pi)
+        inv_dy = real(ny, real32) / (2.0_real32 * pi)
+        half_dt = 0.5_real32 * dt
+        dt_over_6 = dt / 6.0_real32
+        allocate(base(1:nx + 2, 1:ny + 2))
+        allocate(q(1:nx + 2, 1:ny + 2))
+        allocate(q2(1:nx + 2, 1:ny + 2))
+        allocate(acc(1:nx + 2, 1:ny + 2))
+        allocate(vx(1:nx + 1, 1:ny + 2))
+        allocate(vy(1:nx + 2, 1:ny + 1))
+        do concurrent (j = 1:ny + 2, i = 1:nx + 1)
+            vx(i, j) = fields%vx(i, j)
+        end do
+        do concurrent (j = 1:ny + 1, i = 1:nx + 2)
+            vy(i, j) = fields%vy(i, j)
+        end do
+        do concurrent (j = 1:ny + 2, i = 1:nx + 2)
+            base(i, j) = fields%base(i, j)
+            q(i, j) = fields%base(i, j)
+            q2(i, j) = fields%base(i, j)
+            acc(i, j) = 0.0_real32
+        end do
+
+        do step = 1, steps
+            do concurrent (j = 2:ny + 1, i = 2:nx + 1) local(rhs)
+                rhs = fa_fused_rhs(base, vx, vy, nx, ny, i, j, inv_dx, inv_dy, diffusion)
+                acc(i, j) = rhs
+                q(i, j) = base(i, j) + half_dt * rhs
+            end do
+            do concurrent (j = 2:ny + 1, i = 2:nx + 1) local(rhs)
+                rhs = fa_fused_rhs(q, vx, vy, nx, ny, i, j, inv_dx, inv_dy, diffusion)
+                acc(i, j) = acc(i, j) + 2.0_real32 * rhs
+                q2(i, j) = base(i, j) + half_dt * rhs
+            end do
+            do concurrent (j = 2:ny + 1, i = 2:nx + 1) local(rhs)
+                rhs = fa_fused_rhs(q2, vx, vy, nx, ny, i, j, inv_dx, inv_dy, diffusion)
+                acc(i, j) = acc(i, j) + 2.0_real32 * rhs
+                q(i, j) = base(i, j) + dt * rhs
+            end do
+            do concurrent (j = 2:ny + 1, i = 2:nx + 1) local(rhs)
+                rhs = fa_fused_rhs(q, vx, vy, nx, ny, i, j, inv_dx, inv_dy, diffusion)
+                base(i, j) = base(i, j) + dt_over_6 * (acc(i, j) + rhs)
+            end do
+        end do
+
+        do concurrent (j = 1:ny + 2, i = 1:nx + 2)
+            fields%base(i, j) = base(i, j)
+            fields%q(i, j) = base(i, j)
+            fields%acc(i, j) = 0.0_real32
+        end do
+        deallocate(base, q, q2, acc, vx, vy)
+    end subroutine fa_advance_rk4_fused
 
     subroutine fa_write_csv(path, fields, nx, ny)
         character(len=*), intent(in) :: path
